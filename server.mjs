@@ -9,7 +9,24 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 9377);
-const MODEL = process.env.BRIDGE_MODEL || 'sonnet';
+
+// 可选模型（全名）。ST 界面里选哪个，请求就用哪个；未选或不认识时回退到 DEFAULT_MODEL。
+const MODELS = [
+  'claude-fable-5',
+  'claude-opus-4-8',
+  'claude-opus-4-7',
+  'claude-opus-4-6',
+  'claude-opus-4-5',
+  'claude-opus-4-1',
+  'claude-opus-4-0',
+  'claude-sonnet-5',
+  'claude-sonnet-4-6',
+  'claude-sonnet-4-5',
+  'claude-sonnet-4-0',
+];
+const DEFAULT_MODEL = process.env.BRIDGE_MODEL || 'claude-sonnet-5';
+// 记忆更新任务用的模型（默认与回复模型解耦，可用便宜些的档位）
+const MEMORY_MODEL = process.env.MEMORY_MODEL || DEFAULT_MODEL;
 const MEMORY_ROOT = path.join(ROOT, 'memory');
 const RECENT_TURNS = Number(process.env.RECENT_TURNS || 40); // 保留的最近对话轮数，更早的靠记忆文件
 fs.mkdirSync(MEMORY_ROOT, { recursive: true });
@@ -49,7 +66,7 @@ async function updateMemory(lastUserText, replyText) {
     for await (const msg of query({
       prompt,
       options: {
-        model: MODEL,
+        model: MEMORY_MODEL,
         cwd: MEMORY_ROOT,
         allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep'],
         permissionMode: 'acceptEdits',
@@ -100,11 +117,11 @@ function buildPrompt(body) {
 }
 
 // ---------- SDK 调用 ----------
-async function* generate(systemPrompt, prompt) {
+async function* generate(model, systemPrompt, prompt) {
   const q = query({
     prompt,
     options: {
-      model: MODEL,
+      model,
       systemPrompt,
       allowedTools: [],
       settingSources: [],
@@ -126,9 +143,9 @@ async function* generate(systemPrompt, prompt) {
 }
 
 // ---------- OpenAI 兼容层 ----------
-function sseChunk(id, delta, finish = null) {
+function sseChunk(id, model, delta, finish = null) {
   return `data: ${JSON.stringify({
-    id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: MODEL,
+    id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model,
     choices: [{ index: 0, delta, finish_reason: finish }],
   })}\n\n`;
 }
@@ -137,6 +154,7 @@ async function handleChat(req, res, body) {
   const { systemPrompt, prompt, lastUserText } = buildPrompt(body);
   const id = 'chatcmpl-' + Math.random().toString(36).slice(2);
   const stream = body.stream !== false;
+  const model = MODELS.includes(body.model) ? body.model : DEFAULT_MODEL;
   let full = '';
   try {
     if (stream) {
@@ -145,24 +163,24 @@ async function handleChat(req, res, body) {
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
       });
-      res.write(sseChunk(id, { role: 'assistant', content: '' }));
-      for await (const text of generate(systemPrompt, prompt)) {
+      res.write(sseChunk(id, model, { role: 'assistant', content: '' }));
+      for await (const text of generate(model, systemPrompt, prompt)) {
         full += text;
-        res.write(sseChunk(id, { content: text }));
+        res.write(sseChunk(id, model, { content: text }));
       }
-      res.write(sseChunk(id, {}, 'stop'));
+      res.write(sseChunk(id, model, {}, 'stop'));
       res.write('data: [DONE]\n\n');
       res.end();
     } else {
-      for await (const text of generate(systemPrompt, prompt)) full += text;
+      for await (const text of generate(model, systemPrompt, prompt)) full += text;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
-        id, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: MODEL,
+        id, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
         choices: [{ index: 0, message: { role: 'assistant', content: full }, finish_reason: 'stop' }],
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       }));
     }
-    console.log(`[chat] 回复 ${full.length} 字符`);
+    console.log(`[chat] 回复 ${full.length} 字符 (${model})`);
     if (full) updateMemory(lastUserText, full); // 不阻塞，后台跑
   } catch (e) {
     console.error('[chat] 失败:', e.message);
@@ -179,7 +197,7 @@ const server = http.createServer((req, res) => {
   const url = req.url.split('?')[0];
   if (req.method === 'GET' && (url === '/v1/models' || url === '/models')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ object: 'list', data: [{ id: MODEL, object: 'model', owned_by: 'st-claude-bridge' }] }));
+    res.end(JSON.stringify({ object: 'list', data: MODELS.map(id => ({ id, object: 'model', owned_by: 'st-claude-bridge' })) }));
     return;
   }
   if (req.method === 'POST' && (url === '/v1/chat/completions' || url === '/chat/completions')) {
@@ -199,5 +217,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`st-claude-bridge listening on http://127.0.0.1:${PORT}/v1  (model: ${MODEL}, memory: ${MEMORY_ROOT})`);
+  console.log(`st-claude-bridge listening on http://127.0.0.1:${PORT}/v1  (default: ${DEFAULT_MODEL}, memory model: ${MEMORY_MODEL}, memory: ${MEMORY_ROOT})`);
 });
