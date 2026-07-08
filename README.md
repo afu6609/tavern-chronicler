@@ -1,0 +1,89 @@
+# tavern-chronicler
+
+**给 SillyTavern 换一个会记账的大脑。**
+
+一个把 [SillyTavern](https://github.com/SillyTavern/SillyTavern) 接到 [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk) 的桥接服务：ST 继续负责它擅长的前端渲染与角色卡生态，回复生成与**长对话记忆管理**交给 agent——每轮回复后，一个后台 agent 用文件工具维护结构化的战役档案（状态账本、编年史、NPC 台账、伏笔索引），替代"向量化检索"这种在长篇叙事后期必然崩坏的模糊召回。
+
+```
+SillyTavern（前端渲染 / 角色卡 / 预设 / 世界书）
+   │  OpenAI 兼容 API
+   ▼
+tavern-chronicler（本服务）
+   ├── 回复路径（同步、快）：注入战役档案 → Agent SDK 单轮生成 → SSE 流式返回
+   └── 记忆路径（异步、不阻塞）：后台 agent 读写 memory/ 下的 Markdown 档案
+```
+
+## 为什么不用向量化记忆
+
+跑团/长篇 RP 需要的是**状态一致性**，而向量检索给的是**语义相似度**——这是两类问题：
+
+- "背包里有什么"是账本问题，不是检索问题
+- "三十楼前埋的伏笔"在嵌入空间里没有"剧情重要性"这个维度
+- 线性时间与因果链在向量库里完全丢失
+
+Agent 维护的结构化档案（下表）在每轮回复前作为权威状态注入，早期对话原文可以放心截断。
+
+## 环境要求
+
+- Node.js ≥ 20
+- 已安装并登录 [Claude Code](https://claude.com/claude-code)（本服务通过 Agent SDK 复用其登录态，**无需单独的 API key**；订阅额度即可驱动）
+- 一个能连自定义 OpenAI 兼容后端的 SillyTavern（1.12+）
+
+## 快速开始
+
+```sh
+git clone https://github.com/<you>/tavern-chronicler
+cd tavern-chronicler
+npm install
+node server.mjs
+# → st-claude-bridge listening on http://127.0.0.1:9377/v1
+```
+
+然后在 SillyTavern 里：
+
+1. **API 连接**（插头图标）→ API 选 **Chat Completion**，来源选 **Custom (OpenAI-compatible)**
+2. 端点填 `http://127.0.0.1:9377/v1`，API Key 随便填（本服务不校验）
+3. 连接后选择模型，开卡即用——预设、世界书、正则、前端脚本全部照常工作
+
+## 配置（环境变量）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PORT` | `9377` | 监听端口 |
+| `BRIDGE_MODEL` | `sonnet` | 传给 Agent SDK 的模型（`sonnet` / `opus` 等） |
+| `RECENT_TURNS` | `40` | 正文携带的最近对话轮数；更早的历史由战役档案接管 |
+
+## 战役档案（memory/）
+
+由记忆管理器在每轮回复后自动维护，全部是普通 Markdown，**随时可以手动编辑**（agent 会尊重你的修改）：
+
+| 文件 | 内容 |
+|---|---|
+| `world_state.md` | 游戏内时间 / 地点 / 天气 / 当前任务与目标 |
+| `party.md` | 队伍 HP、状态、装备、金钱账本 |
+| `npc_ledger.md` | 出场 NPC 的态度、承诺、已知信息 |
+| `timeline.md` | 按事件压缩的编年史（只追加） |
+| `foreshadowing.md` | 未回收的伏笔与悬念 |
+
+回复前这些文件作为 `<campaign_memory>` 注入 system prompt；记忆更新任务同一时间只跑一个，重叠时自动跳过（下一轮会补记）。
+
+## 已知限制（MVP）
+
+- **单战役**：所有聊天共用一个 `memory/` 目录，换战役请先备份/清空
+- **记忆有一轮延迟**：本轮的变化在下一轮才可见
+- 多轮消息被展平为 transcript 交给 SDK（Agent SDK 是单提示模型），对格式极敏感的预设可能有细微差异
+
+## 路线图
+
+- [ ] 多战役隔离（按角色卡哈希分目录）
+- [ ] 回复前的定向检索（让 agent 主动翻档案回答"某某说过什么"）
+- [ ] 掷骰 / 先攻 / 规则查询工具（进程内工具，解决 LLM 掷骰不随机）
+- [ ] 档案压缩策略（编年史分卷归档）
+
+## 内容边界
+
+本项目定位为 **SFW 的跑团 / 叙事实验工具**。请注意你接入的角色卡与预设内容需符合 Anthropic 的使用政策——含露骨内容或"破限"指令的卡与预设不仅违反政策，也会导致频繁拒绝，无法正常使用。
+
+## License
+
+MIT

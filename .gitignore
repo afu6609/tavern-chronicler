@@ -1,0 +1,3 @@
+node_modules/
+# 战役档案是玩家私人数据，不入库
+memory/*.md
