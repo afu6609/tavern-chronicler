@@ -65,7 +65,7 @@ node server.mjs
 | `RECALL_MODEL` | `claude-haiku-4-5-20251001` | sdk 模式用的模型 |
 | `RECALL_API_URL` | — | api 模式的端点（如 `https://xxx/v1`），配合 `RECALL_API_KEY`、`RECALL_API_MODEL` |
 | `RECALL_BUDGET` | `6000` | 回溯注入内容的字符预算 |
-| `RECALL_TIMEOUT` | `20000` | 回溯整体超时（ms），超时直接放弃、不阻塞回复 |
+| `RECALL_TIMEOUT` | `30000` | 回溯整体超时（ms），超时直接放弃、不阻塞回复 |
 
 ### 可选模型
 
@@ -124,6 +124,14 @@ node server.mjs
 
 回溯只在归档长度超过 `RECENT_TURNS` 后才启动（窗口内的内容本来就在 prompt 里）。两种后端延迟差异明显：`sdk` 模式受子进程冷启动拖累（实测约 20s），**追求响应速度建议配 `api` 模式接轻量快速模型**（实测检索部分仅几十 ms，加上模型延迟通常 1-2s）。
 
+## 用量统计
+
+三条路径（回复 / 记忆 / 回溯）的 token 消耗全程统计：
+
+- 每条日志尾部带 `[tokens: in X, out Y, cache rA/wB]`（SDK 调用会区分缓存读写）
+- `GET /stats` 返回本次运行的分路径汇总与按战役累计（战役累计持久化在各自 `meta.json`）
+- `/v1/chat/completions` 的响应（含流式末块）回填真实 `usage`，ST 端如有 token 显示可直接用
+
 ## 已知限制（MVP）
 
 - **记忆有一轮延迟**：本轮的变化在下一轮才可见
@@ -136,7 +144,7 @@ node server.mjs
 - [x] 对话原文归档 + 重roll/编辑的档案修正
 - [x] 回复前的定向回溯（出词 → 本地检索 → 压缩注入，双后端 sdk/api）
 - [ ] 掷骰 / 先攻 / 规则查询工具（进程内工具，解决 LLM 掷骰不随机）
-- [ ] 档案压缩策略（编年史分卷归档）
+- [ ] 档案分卷归档：timeline 超线时旧章节整体搬入 `chronicle/vol-N.md`（不注入 prompt 但可被回溯下钻），主文件只留卷目录+当前卷；foreshadowing 已回收伏笔搬入 `resolved.md`。解决超长战役下"200 行压缩线反复有损压缩"与"回溯导航图退化"两个问题
 
 ## 内容边界
 
