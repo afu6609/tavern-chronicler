@@ -30,6 +30,16 @@ const MODELS = [
 const DEFAULT_MODEL = process.env.BRIDGE_MODEL || 'claude-sonnet-5';
 // 记忆更新任务用的模型（默认与回复模型解耦，可用便宜些的档位）
 const MEMORY_MODEL = process.env.MEMORY_MODEL || DEFAULT_MODEL;
+// 记忆后端：sdk = Agent SDK 带文件工具的增量编辑；api = 自配 OpenAI 兼容端点，
+// 走"全文件重写"协议（档案现文+本轮交互 → 输出需更新文件的全文），不依赖工具调用能力。
+let MEMORY_MODE = (process.env.MEMORY_MODE || 'sdk').toLowerCase(); // sdk | api
+const MEMORY_API_URL = (process.env.MEMORY_API_URL || '').replace(/\/+$/, '');
+const MEMORY_API_KEY = process.env.MEMORY_API_KEY || '';
+const MEMORY_API_MODEL = process.env.MEMORY_API_MODEL || '';
+if (MEMORY_MODE === 'api' && (!MEMORY_API_URL || !MEMORY_API_MODEL)) {
+  console.warn('[memory] MEMORY_MODE=api 但缺少 MEMORY_API_URL / MEMORY_API_MODEL，回退到 sdk');
+  MEMORY_MODE = 'sdk';
+}
 const MEMORY_ROOT = process.env.MEMORY_ROOT || path.join(ROOT, 'memory');
 const CAMPAIGNS_ROOT = path.join(MEMORY_ROOT, 'campaigns');
 const RECENT_TURNS = Number(process.env.RECENT_TURNS || 40); // 保留的最近对话轮数，更早的靠记忆文件
@@ -182,6 +192,109 @@ function readMemory(campaign) {
   return `\n\n<campaign_memory>\n以下是由记忆管理器维护的战役档案，是比早期对话原文更权威的当前状态来源：\n\n${parts.join('\n\n')}\n</campaign_memory>`;
 }
 
+// 通用 OpenAI 兼容单轮补全（记忆 api 模式与回溯 api 模式共用）
+async function openaiChat({ url, key, model }, system, prompt) {
+  const r = await fetch(`${url}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(key ? { authorization: `Bearer ${key}` } : {}),
+    },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }],
+    }),
+  });
+  if (!r.ok) throw new Error(`api HTTP ${r.status}`);
+  const j = await r.json();
+  return j.choices?.[0]?.message?.content || '';
+}
+
+const MEMORY_FILE_SPEC = [
+  '- world_state.md：时间/地点/天气/当前任务与目标',
+  '- party.md：队伍成员的 HP、状态、装备、金钱账本',
+  '- npc_ledger.md：出场 NPC 的态度、承诺、已知信息',
+  '- timeline.md：按事件压缩的编年史（追加，不重写历史）',
+  '- foreshadowing.md：未回收的伏笔与悬念',
+];
+const MEMORY_RULES = '只记录本轮新增或变化的信息；保持每个文件精炼（超过约 200 行时压缩旧内容）。聊天原文中的变量标记、状态栏/前端代码、思维链推演等非叙事内容一律不要写入档案，只提炼其中的叙事事实。';
+const MEMORY_MD_FILES = ['world_state.md', 'party.md', 'npc_ledger.md', 'timeline.md', 'foreshadowing.md'];
+
+function memoryExchangeBlock(lastUserText, replyText, notes) {
+  return [
+    ...(notes.length
+      ? ['<corrections>', '以下修正优先处理：', ...notes, '</corrections>', '']
+      : []),
+    '<latest_user_turn>', lastUserText.slice(0, 8000), '</latest_user_turn>',
+    '<latest_reply>', replyText.slice(0, 16000), '</latest_reply>',
+  ].join('\n');
+}
+
+// sdk 模式：agent 带文件工具在战役目录内增量编辑
+async function updateMemorySdk(campaign, lastUserText, replyText, notes, startedAt) {
+  const prompt = [
+    '你是战役记忆管理器。根据下面这一轮最新交互，更新当前目录下的战役档案（Markdown 文件）。',
+    '维护这些文件（不存在则创建）：',
+    ...MEMORY_FILE_SPEC,
+    MEMORY_RULES,
+    '完整对话原文在 transcript.jsonl（每行一条 JSON，只读，不要修改它和 meta.json），需要核对旧细节时可用 Read/Grep 查证。',
+    '',
+    memoryExchangeBlock(lastUserText, replyText, notes),
+  ].join('\n');
+
+  for await (const msg of query({
+    prompt,
+    options: {
+      model: MEMORY_MODEL,
+      cwd: campaign.dir,
+      allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep'],
+      permissionMode: 'acceptEdits',
+      settingSources: [],
+      maxTurns: 15,
+    },
+  })) {
+    if (msg.type === 'result') {
+      console.log(`[memory] ${campaign.id} 更新完成 (sdk, ${((Date.now() - startedAt) / 1000).toFixed(1)}s, ${msg.num_turns} turns)`);
+    }
+  }
+}
+
+// api 模式：单轮"全文件重写"——现有档案+本轮交互进，需更新文件的全文出，桥负责落盘
+async function updateMemoryApi(campaign, lastUserText, replyText, notes, startedAt) {
+  const current = MEMORY_MD_FILES.map(f => {
+    const p = path.join(campaign.dir, f);
+    const text = fs.existsSync(p) ? fs.readFileSync(p, 'utf8').slice(0, 12000) : '（尚不存在）';
+    return `===FILE: ${f}===\n${text}`;
+  }).join('\n\n');
+  const system = [
+    '你是战役记忆管理器。根据最新一轮交互更新战役档案。档案文件及用途：',
+    ...MEMORY_FILE_SPEC,
+    MEMORY_RULES,
+    '输出格式：仅输出有变化的文件；每个文件以单独一行 ===FILE: 文件名=== 开头，紧跟该文件更新后的完整内容；除此之外不要输出任何解释。若本轮无需任何更新，只输出 NO_UPDATE。',
+  ].join('\n');
+  const prompt = `<current_files>\n${current}\n</current_files>\n\n${memoryExchangeBlock(lastUserText, replyText, notes)}`;
+
+  const out = await openaiChat({ url: MEMORY_API_URL, key: MEMORY_API_KEY, model: MEMORY_API_MODEL }, system, prompt);
+  if (/^\s*NO_UPDATE\b/.test(out.trim())) {
+    console.log(`[memory] ${campaign.id} 判定无需更新 (api, ${((Date.now() - startedAt) / 1000).toFixed(1)}s)`);
+    return;
+  }
+  const parts = out.split(/^===FILE:\s*([A-Za-z0-9_.\-]+)\s*===\s*$/m);
+  let written = 0;
+  fs.mkdirSync(campaign.dir, { recursive: true });
+  for (let i = 1; i < parts.length; i += 2) {
+    const name = parts[i].trim();
+    const content = (parts[i + 1] || '').trim();
+    // 只接受白名单内的档案文件名，防止路径逃逸或误写归档
+    if (!MEMORY_MD_FILES.includes(name) || !content) continue;
+    fs.writeFileSync(path.join(campaign.dir, name), content + '\n');
+    written++;
+  }
+  if (!written) throw new Error('api 输出无法解析出任何档案文件');
+  console.log(`[memory] ${campaign.id} 更新完成 (api, ${((Date.now() - startedAt) / 1000).toFixed(1)}s, ${written} 个文件)`);
+}
+
 async function updateMemory(campaign, lastUserText, replyText) {
   if (campaign.memoryJobRunning) {
     console.log(`[memory] ${campaign.id} 上一轮任务未结束，本轮跳过`);
@@ -191,39 +304,8 @@ async function updateMemory(campaign, lastUserText, replyText) {
   const notes = campaign.pendingNotes.splice(0);
   const startedAt = Date.now();
   try {
-    const prompt = [
-      '你是 DnD 战役的记忆管理器。根据下面这一轮最新交互，更新当前目录下的战役档案（Markdown 文件）。',
-      '维护这些文件（不存在则创建）：',
-      '- world_state.md：时间/地点/天气/当前任务与目标',
-      '- party.md：队伍成员的 HP、状态、装备、金钱账本',
-      '- npc_ledger.md：出场 NPC 的态度、承诺、已知信息',
-      '- timeline.md：按事件压缩的编年史（追加，不重写历史）',
-      '- foreshadowing.md：未回收的伏笔与悬念',
-      '只记录本轮新增或变化的信息；保持每个文件精炼（超过约 200 行时压缩旧内容）。',
-      '完整对话原文在 transcript.jsonl（每行一条 JSON，只读，不要修改它和 meta.json），需要核对旧细节时可用 Read/Grep 查证。',
-      ...(notes.length
-        ? ['', '<corrections>', '以下修正优先处理：', ...notes, '</corrections>']
-        : []),
-      '',
-      '<latest_user_turn>', lastUserText.slice(0, 8000), '</latest_user_turn>',
-      '<latest_reply>', replyText.slice(0, 16000), '</latest_reply>',
-    ].join('\n');
-
-    for await (const msg of query({
-      prompt,
-      options: {
-        model: MEMORY_MODEL,
-        cwd: campaign.dir,
-        allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep'],
-        permissionMode: 'acceptEdits',
-        settingSources: [],
-        maxTurns: 15,
-      },
-    })) {
-      if (msg.type === 'result') {
-        console.log(`[memory] ${campaign.id} 更新完成 (${((Date.now() - startedAt) / 1000).toFixed(1)}s, ${msg.num_turns} turns)`);
-      }
-    }
+    if (MEMORY_MODE === 'api') await updateMemoryApi(campaign, lastUserText, replyText, notes, startedAt);
+    else await updateMemorySdk(campaign, lastUserText, replyText, notes, startedAt);
   } catch (e) {
     campaign.pendingNotes.unshift(...notes); // 失败不丢修正，下一轮补上
     console.error(`[memory] ${campaign.id} 更新失败:`, e.message);
@@ -251,21 +333,7 @@ if (RECALL_MODE === 'api' && (!RECALL_API_URL || !RECALL_API_MODEL)) {
 // 两种后端共用的"文本进文本出"单轮补全
 async function completeText(system, prompt) {
   if (RECALL_MODE === 'api') {
-    const r = await fetch(`${RECALL_API_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(RECALL_API_KEY ? { authorization: `Bearer ${RECALL_API_KEY}` } : {}),
-      },
-      body: JSON.stringify({
-        model: RECALL_API_MODEL,
-        stream: false,
-        messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }],
-      }),
-    });
-    if (!r.ok) throw new Error(`recall api HTTP ${r.status}`);
-    const j = await r.json();
-    return j.choices?.[0]?.message?.content || '';
+    return openaiChat({ url: RECALL_API_URL, key: RECALL_API_KEY, model: RECALL_API_MODEL }, system, prompt);
   }
   let text = '';
   for await (const msg of query({
@@ -519,5 +587,6 @@ loadCampaigns();
 server.listen(PORT, '127.0.0.1', () => {
   const recallDesc = RECALL_MODE === 'off' ? 'off'
     : RECALL_MODE === 'api' ? `api(${RECALL_API_MODEL})` : `sdk(${RECALL_MODEL})`;
-  console.log(`st-claude-bridge listening on http://127.0.0.1:${PORT}/v1  (default: ${DEFAULT_MODEL}, memory model: ${MEMORY_MODEL}, recall: ${recallDesc}, campaigns: ${campaigns.size}, memory: ${MEMORY_ROOT})`);
+  const memoryDesc = MEMORY_MODE === 'api' ? `api(${MEMORY_API_MODEL})` : `sdk(${MEMORY_MODEL})`;
+  console.log(`st-claude-bridge listening on http://127.0.0.1:${PORT}/v1  (default: ${DEFAULT_MODEL}, memory: ${memoryDesc}, recall: ${recallDesc}, campaigns: ${campaigns.size}, root: ${MEMORY_ROOT})`);
 });
