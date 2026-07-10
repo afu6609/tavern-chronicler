@@ -232,6 +232,115 @@ async function updateMemory(campaign, lastUserText, replyText) {
   }
 }
 
+// ---------- 定向回溯 ----------
+// 设计：LLM 只负责"出检索词"和"压缩结果"（各一次单轮小调用），检索本身是进程内
+// 毫秒级文本扫描——不用开放式 agent 循环，避免多回合工具往返的延迟。
+// 仅当归档长度超出提示词窗口（RECENT_TURNS）时才启动；窗口内的内容本来就在 prompt 里。
+let RECALL_MODE = (process.env.RECALL_MODE || 'sdk').toLowerCase(); // sdk | api | off
+const RECALL_MODEL = process.env.RECALL_MODEL || 'claude-haiku-4-5-20251001';
+const RECALL_API_URL = (process.env.RECALL_API_URL || '').replace(/\/+$/, '');
+const RECALL_API_KEY = process.env.RECALL_API_KEY || '';
+const RECALL_API_MODEL = process.env.RECALL_API_MODEL || '';
+const RECALL_BUDGET = Number(process.env.RECALL_BUDGET || 6000);   // 注入内容的字符预算
+const RECALL_TIMEOUT = Number(process.env.RECALL_TIMEOUT || 20000); // 整个回溯的超时，超时放弃不阻塞回复
+if (RECALL_MODE === 'api' && (!RECALL_API_URL || !RECALL_API_MODEL)) {
+  console.warn('[recall] RECALL_MODE=api 但缺少 RECALL_API_URL / RECALL_API_MODEL，回溯已停用');
+  RECALL_MODE = 'off';
+}
+
+// 两种后端共用的"文本进文本出"单轮补全
+async function completeText(system, prompt) {
+  if (RECALL_MODE === 'api') {
+    const r = await fetch(`${RECALL_API_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(RECALL_API_KEY ? { authorization: `Bearer ${RECALL_API_KEY}` } : {}),
+      },
+      body: JSON.stringify({
+        model: RECALL_API_MODEL,
+        stream: false,
+        messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }],
+      }),
+    });
+    if (!r.ok) throw new Error(`recall api HTTP ${r.status}`);
+    const j = await r.json();
+    return j.choices?.[0]?.message?.content || '';
+  }
+  let text = '';
+  for await (const msg of query({
+    prompt,
+    options: { model: RECALL_MODEL, systemPrompt: system, allowedTools: [], settingSources: [], maxTurns: 1 },
+  })) {
+    if (msg.type === 'result' && msg.subtype === 'success') text = msg.result || '';
+  }
+  return text;
+}
+
+const withTimeout = (p, ms, tag) => Promise.race([
+  p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${tag} 超时 (${ms}ms)`)), ms)),
+]);
+
+// 进程内检索：只扫提示词窗口之外的早期轮次，命中轮附带前后各一轮上下文
+function searchArchive(campaign, queries) {
+  const t = campaign.transcript;
+  const searchable = Math.max(0, t.length - RECENT_TURNS);
+  if (!searchable) return [];
+  const hit = new Set();
+  for (const q of queries) {
+    const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    for (let i = 0; i < searchable; i++) {
+      if (re.test(t[i].content || '')) {
+        if (i > 0) hit.add(i - 1);
+        hit.add(i);
+        if (i + 1 < searchable) hit.add(i + 1);
+      }
+    }
+  }
+  const out = [];
+  let used = 0;
+  for (const i of [...hit].sort((a, b) => a - b)) {
+    const line = `#${i + 1} [${t[i].role}] ${(t[i].content || '').replace(/\s+/g, ' ').slice(0, 600)}`;
+    if (used + line.length > RECALL_BUDGET) break;
+    out.push(line);
+    used += line.length;
+  }
+  return out;
+}
+
+async function runRecall(campaign, lastUserText) {
+  const started = Date.now();
+  const timelinePath = path.join(campaign.dir, 'timeline.md');
+  const timeline = fs.existsSync(timelinePath)
+    ? fs.readFileSync(timelinePath, 'utf8').slice(-3000)
+    : '（暂无编年史）';
+  const qSystem = '你是对话归档检索助手。根据剧情编年史和最新一条消息，判断这一轮是否需要从早期对话原文中查证旧细节（旧承诺、旧台词、具体数字、名字对应关系等）。只输出严格 JSON，不要输出任何其他内容：需要时 {"queries":["关键词1","关键词2"]}（1-4 个具体的名字/物品/地点/事件关键词，不要整句）；不需要时 {"queries":[]}。';
+  const raw = await completeText(qSystem,
+    `<timeline>\n${timeline}\n</timeline>\n\n<latest_message>\n${lastUserText.slice(0, 2000)}\n</latest_message>`);
+  const m = raw.match(/\{[\s\S]*\}/);
+  if (!m) { console.log(`[recall] ${campaign.id} 检索词解析失败，跳过`); return ''; }
+  let queries;
+  try { queries = JSON.parse(m[0]).queries || []; } catch { return ''; }
+  queries = queries.filter(q => typeof q === 'string' && q.trim()).slice(0, 4);
+  if (!queries.length) {
+    console.log(`[recall] ${campaign.id} 判定无需检索 (${Date.now() - started}ms)`);
+    return '';
+  }
+  const lines = searchArchive(campaign, queries);
+  if (!lines.length) {
+    console.log(`[recall] ${campaign.id} 检索 [${queries.join('、')}] 无命中 (${Date.now() - started}ms)`);
+    return '';
+  }
+  let content = lines.join('\n');
+  if (content.length > 2500) { // 命中较多时再花一次调用压缩，避免注入过长
+    const sSystem = '把检索到的对话片段压缩成与当前话题相关的备忘录（300字以内）。保留具体数字、名字、承诺与关键原话，并保留轮号标注（#N）。只输出备忘录正文。';
+    content = await completeText(sSystem,
+      `<latest_message>\n${lastUserText.slice(0, 1000)}\n</latest_message>\n\n<excerpts>\n${content}\n</excerpts>`);
+  }
+  console.log(`[recall] ${campaign.id} 检索 [${queries.join('、')}] 命中 ${lines.length} 段，注入 ${content.length} 字符 (${Date.now() - started}ms)`);
+  return `\n\n<archive_recall>\n以下是根据本轮话题从对话原文归档中检索到的早期内容（#N 为轮号），可用于核对旧细节：\n${content}\n</archive_recall>`;
+}
+
 // ---------- 提示构建 ----------
 function buildPrompt(body) {
   const messages = body.messages || [];
@@ -326,7 +435,15 @@ function sseChunk(id, model, delta, finish = null) {
 }
 
 async function handleChat(req, res, body) {
-  const { campaign, systemPrompt, prompt, lastUserText } = buildPrompt(body);
+  const { campaign, systemPrompt: baseSystem, prompt, lastUserText } = buildPrompt(body);
+  let systemPrompt = baseSystem;
+  if (RECALL_MODE !== 'off' && campaign && campaign.transcript.length > RECENT_TURNS && lastUserText) {
+    try {
+      systemPrompt += await withTimeout(runRecall(campaign, lastUserText), RECALL_TIMEOUT, 'recall');
+    } catch (e) {
+      console.error('[recall] 失败，跳过:', e.message);
+    }
+  }
   const id = 'chatcmpl-' + Math.random().toString(36).slice(2);
   const stream = body.stream !== false;
   const model = MODELS.includes(body.model) ? body.model : DEFAULT_MODEL;
@@ -400,5 +517,7 @@ const server = http.createServer((req, res) => {
 
 loadCampaigns();
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`st-claude-bridge listening on http://127.0.0.1:${PORT}/v1  (default: ${DEFAULT_MODEL}, memory model: ${MEMORY_MODEL}, campaigns: ${campaigns.size}, memory: ${MEMORY_ROOT})`);
+  const recallDesc = RECALL_MODE === 'off' ? 'off'
+    : RECALL_MODE === 'api' ? `api(${RECALL_API_MODEL})` : `sdk(${RECALL_MODEL})`;
+  console.log(`st-claude-bridge listening on http://127.0.0.1:${PORT}/v1  (default: ${DEFAULT_MODEL}, memory model: ${MEMORY_MODEL}, recall: ${recallDesc}, campaigns: ${campaigns.size}, memory: ${MEMORY_ROOT})`);
 });
