@@ -33,6 +33,9 @@ const MEMORY_MODEL = process.env.MEMORY_MODEL || DEFAULT_MODEL;
 const MEMORY_ROOT = process.env.MEMORY_ROOT || path.join(ROOT, 'memory');
 const CAMPAIGNS_ROOT = path.join(MEMORY_ROOT, 'campaigns');
 const RECENT_TURNS = Number(process.env.RECENT_TURNS || 40); // 保留的最近对话轮数，更早的靠记忆文件
+// 结尾续写指令。默认保持中性：视角/人称/角色分配完全交给预设决定，桥不越权指定身份。
+const CONTINUE_PROMPT = process.env.CONTINUE_PROMPT
+  || '衔接 transcript 最后一条消息，遵循 system 中的全部设定（包括视角、人称、文风与角色分配），自然地续写下一条回复。只输出回复正文，不要输出任何解释或前缀。';
 fs.mkdirSync(CAMPAIGNS_ROOT, { recursive: true });
 
 // ---------- 战役库 ----------
@@ -263,7 +266,7 @@ function buildPrompt(body) {
       );
       const excerpt = discarded.map(t => (t.content || '').slice(0, 300)).join('\n---\n');
       campaign.pendingNotes.push(
-        `玩家重新生成或编辑了对话，以下旧 GM 回复（节选）已被弃用；若档案里记录了其中已不成立的内容，请修订：\n${excerpt}`,
+        `玩家重新生成或编辑了对话，以下旧回复（节选）已被弃用；若档案里记录了其中已不成立的内容，请修订：\n${excerpt}`,
       );
       console.log(`[campaign] ${campaign.id} 检测到重roll/编辑，${discarded.length} 条旧回复弃用`);
     }
@@ -274,7 +277,7 @@ function buildPrompt(body) {
   const recent = turns.slice(-RECENT_TURNS);
   const dropped = turns.length - recent.length;
   const transcriptText = recent
-    .map(t => (t.role === 'assistant' ? `[GM]\n${t.content}` : `[玩家]\n${t.content}`))
+    .map(t => (t.role === 'assistant' ? `[assistant]\n${t.content}` : `[user]\n${t.content}`))
     .join('\n\n');
 
   const systemPrompt = systemParts.join('\n\n') + (campaign ? readMemory(campaign) : '');
@@ -282,7 +285,7 @@ function buildPrompt(body) {
     dropped > 0 ? `（更早的 ${dropped} 条对话已归档进战役记忆，见 system 中的 campaign_memory）` : '',
     '<transcript>', transcriptText, '</transcript>',
     '',
-    '以 GM 身份直接续写下一条回复。只输出回复正文，不要输出任何解释或前缀。',
+    CONTINUE_PROMPT,
   ].filter(Boolean).join('\n');
 
   return { campaign, systemPrompt, prompt, lastUserText };
