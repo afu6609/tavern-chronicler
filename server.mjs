@@ -46,6 +46,17 @@ const MEMORY_MAX_TURNS = Number(process.env.MEMORY_MAX_TURNS || 30);
 const MEMORY_ROOT = process.env.MEMORY_ROOT || path.join(ROOT, 'memory');
 const CAMPAIGNS_ROOT = path.join(MEMORY_ROOT, 'campaigns');
 const RECENT_TURNS = Number(process.env.RECENT_TURNS || 40); // 保留的最近对话轮数，更早的靠记忆文件
+// 推理力度（仅 SDK 模式生效）：low | medium | high | xhigh | max，未设置时跟随 SDK 默认（high）。
+// RECALL_EFFORT 默认 low：提取检索词是机械任务，深度思考只烧 token、拖慢管道。
+const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+function effortOf(name, dflt = '') {
+  const v = (process.env[name] || dflt).toLowerCase();
+  if (v && !EFFORT_LEVELS.has(v)) console.warn(`[config] ${name}=${v} 不是有效推理等级，已忽略`);
+  return EFFORT_LEVELS.has(v) ? v : undefined;
+}
+const CHAT_EFFORT = effortOf('CHAT_EFFORT');
+const RECALL_EFFORT = effortOf('RECALL_EFFORT', 'low');
+const MEMORY_EFFORT = effortOf('MEMORY_EFFORT');
 // 结尾续写指令。默认保持中性：视角/人称/角色分配完全交给预设决定，桥不越权指定身份。
 const CONTINUE_PROMPT = process.env.CONTINUE_PROMPT
   || '衔接 transcript 最后一条消息，遵循 system 中的全部设定（包括视角、人称、文风与角色分配），自然地续写下一条回复。只输出回复正文，不要输出任何解释或前缀。';
@@ -298,6 +309,7 @@ async function updateMemorySdk(campaign, lastUserText, replyText, notes, started
       permissionMode: 'acceptEdits',
       settingSources: [],
       maxTurns: MEMORY_MAX_TURNS,
+      ...(MEMORY_EFFORT ? { effort: MEMORY_EFFORT } : {}),
     },
   })) {
     if (msg.type === 'result') {
@@ -389,7 +401,10 @@ async function completeText(system, prompt) {
   let usage = null;
   for await (const msg of query({
     prompt,
-    options: { model: RECALL_MODEL, systemPrompt: system, allowedTools: [], settingSources: [], maxTurns: 1 },
+    options: {
+      model: RECALL_MODEL, systemPrompt: system, allowedTools: [], settingSources: [], maxTurns: 1,
+      ...(RECALL_EFFORT ? { effort: RECALL_EFFORT } : {}),
+    },
   })) {
     if (msg.type === 'result' && msg.subtype === 'success') {
       text = msg.result || '';
@@ -594,6 +609,7 @@ async function* generate(model, systemPrompt, prompt, cwd, usageOut = {}, withDi
       settingSources: [],
       includePartialMessages: true,
       cwd,
+      ...(CHAT_EFFORT ? { effort: CHAT_EFFORT } : {}),
       // 掷骰工具启用时放开工具循环，其余场合保持纯单轮生成
       ...(withDice
         ? { mcpServers: { dice: diceServer }, allowedTools: ['mcp__dice__roll'], maxTurns: DICE_MAX_TURNS }
