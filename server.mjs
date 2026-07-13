@@ -40,6 +40,8 @@ if (MEMORY_MODE === 'api' && (!MEMORY_API_URL || !MEMORY_API_MODEL)) {
   console.warn('[memory] MEMORY_MODE=api 但缺少 MEMORY_API_URL / MEMORY_API_MODEL，回退到 sdk');
   MEMORY_MODE = 'sdk';
 }
+// 记忆 agent 的最大工具回合数：真实卡的长回复+5文件读写实测可超 15，放宽默认值
+const MEMORY_MAX_TURNS = Number(process.env.MEMORY_MAX_TURNS || 30);
 const MEMORY_ROOT = process.env.MEMORY_ROOT || path.join(ROOT, 'memory');
 const CAMPAIGNS_ROOT = path.join(MEMORY_ROOT, 'campaigns');
 const RECENT_TURNS = Number(process.env.RECENT_TURNS || 40); // 保留的最近对话轮数，更早的靠记忆文件
@@ -214,7 +216,11 @@ function reconcile(campaign, incoming) {
     // 找不到锚点（如首条被编辑）：谁更长信谁
     return { transcript: incH.length >= storedH.length ? incoming.slice() : stored, discarded: [] };
   }
-  const discarded = stored.slice(bestI + bestRun).filter(t => t.role === 'assistant');
+  // 只有"存档比本次请求更长出的尾巴"才算被弃用——真重roll时请求会停在待重新生成的
+  // 用户消息上。与 incoming 同位置但内容不同的轮次是修改/前端变换（ST 的正则脚本会
+  // 改写 assistant 消息后回传，桥暂存的原始回复次轮必然被 ST 版本替换），静默以
+  // incoming 为准，不算弃用。
+  const discarded = stored.slice(bestI + incoming.length).filter(t => t.role === 'assistant');
   return { transcript: stored.slice(0, bestI).concat(incoming), discarded };
 }
 
@@ -290,11 +296,12 @@ async function updateMemorySdk(campaign, lastUserText, replyText, notes, started
       allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep'],
       permissionMode: 'acceptEdits',
       settingSources: [],
-      maxTurns: 15,
+      maxTurns: MEMORY_MAX_TURNS,
     },
   })) {
     if (msg.type === 'result') {
       const tag = trackUsage('memory', campaign, msg.usage);
+      if (msg.subtype !== 'success') throw new Error(`SDK result: ${msg.subtype}`);
       console.log(`[memory] ${campaign.id} 更新完成 (sdk, ${((Date.now() - startedAt) / 1000).toFixed(1)}s, ${msg.num_turns} turns)${tag}`);
     }
   }
