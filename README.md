@@ -147,6 +147,7 @@ node server.mjs
 - [x] 对话原文归档 + 重roll/编辑的档案修正
 - [x] 回复前的定向回溯（出词 → 本地检索 → 压缩注入，双后端 sdk/api）
 - [ ] 掷骰 / 先攻 / 规则查询工具（进程内工具，解决 LLM 掷骰不随机）
+- [ ] 旧对话导入器：`import.mjs` 把 ST 聊天 JSONL（`data/<user>/chats/<角色>/*.jsonl`）转为战役 transcript（战役识别靠用户消息指纹即可对接，assistant 侧差异由和解逻辑静默对齐）；配套"补课模式"分批跑记忆 agent 消化全史、构建初始档案——补课期间回溯即刻可用
 - [ ] 档案分卷归档：timeline 超线时旧章节整体搬入 `chronicle/vol-N.md`（不注入 prompt 但可被回溯下钻），主文件只留卷目录+当前卷；foreshadowing 已回收伏笔搬入 `resolved.md`。解决超长战役下"200 行压缩线反复有损压缩"与"回溯导航图退化"两个问题
 
 ## 内容边界
