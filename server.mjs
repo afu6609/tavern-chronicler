@@ -8,7 +8,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 9377);
@@ -465,6 +466,65 @@ async function runRecall(campaign, lastUserText) {
   return `\n\n<archive_recall>\n以下是根据本轮话题从对话原文归档中检索到的早期内容（#N 为轮号），可用于核对旧细节：\n${content}\n</archive_recall>`;
 }
 
+// ---------- 掷骰 ----------
+// 解决 LLM 掷骰不随机（骰运永远偏向剧情需要）的问题。两种机制：
+//   tool：进程内 MCP 工具，模型叙事到检定点时暂停调用 roll，基于真随机结果续写成败（推荐）
+//   pool：请求前预掷一批真随机数注入 system，指示模型按序消耗（零延迟，但约束靠模型自觉）
+// 触发控制（兼容非跑团场景）：auto 模式下扫描 system prompt（预设+卡+世界书）中的
+// 规则关键词，没有检定/骰点语境的卡完全不启用，prompt 零污染。
+const DICE_MODE = (process.env.DICE_MODE || 'tool').toLowerCase();      // tool | pool | off
+const DICE_TRIGGER = (process.env.DICE_TRIGGER || 'auto').toLowerCase(); // auto | always
+const DICE_MAX_TURNS = Number(process.env.DICE_MAX_TURNS || 6); // tool 模式下回复 agent 的回合上限
+const DICE_KEYWORDS = /\b\d{0,2}d(?:4|6|8|10|12|20|100)\b|检定|掷骰|骰点|骰子|先攻|豁免|DC\s*\d|跑团|TRPG|龙与地下城|克苏鲁的呼唤|理智检定|San值|命中骰|伤害骰/i;
+
+function diceArmed(systemPrompt) {
+  if (DICE_MODE === 'off') return false;
+  if (DICE_TRIGGER === 'always') return true;
+  return DICE_KEYWORDS.test(systemPrompt);
+}
+
+// 解析并投掷 NdM+K（1≤N≤100，2≤M≤1000），crypto 真随机
+function rollFormula(formula) {
+  const m = String(formula).trim().match(/^(\d{0,3})[dD](\d{1,4})\s*([+-]\s*\d{1,4})?$/);
+  if (!m) throw new Error(`无法解析骰式: ${formula}（支持 NdM+K，如 1d20+5、2d6、d100）`);
+  const n = Math.min(Math.max(Number(m[1] || 1), 1), 100);
+  const faces = Math.min(Math.max(Number(m[2]), 2), 1000);
+  const mod = m[3] ? Number(m[3].replace(/\s/g, '')) : 0;
+  const rolls = Array.from({ length: n }, () => crypto.randomInt(1, faces + 1));
+  const total = rolls.reduce((a, b) => a + b, 0) + mod;
+  const modText = mod ? (mod > 0 ? ` +${mod}` : ` ${mod}`) : '';
+  return { total, text: `${n}d${faces}${modText} = [${rolls.join(', ')}]${modText} = ${total}` };
+}
+
+const diceServer = createSdkMcpServer({
+  name: 'dice',
+  version: '1.0.0',
+  tools: [
+    tool(
+      'roll',
+      '真随机掷骰。仅在剧情确实需要骰点（属性/技能检定、攻击、伤害、先攻、随机表等）时调用，formula 形如 1d20+5、2d6、d100。必须以返回的结果为准叙述成败，不得自行虚构点数。',
+      { formula: z.string().describe('骰式，NdM+K 格式') },
+      async ({ formula }) => {
+        try {
+          const r = rollFormula(formula);
+          console.log(`[dice] ${r.text}`);
+          return { content: [{ type: 'text', text: r.text }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: e.message }], isError: true };
+        }
+      },
+    ),
+  ],
+});
+
+const DICE_TOOL_HINT = '\n\n<dice_tool>\n已接入真随机掷骰工具 roll（骰式如 1d20+5）。当剧情需要检定/攻击/伤害等骰点时调用它，并严格以返回结果叙述成败；纯对话与叙事场合不要调用。骰点结果请在正文中如实呈现（如"检定：1d20+3=17，成功"）。\n</dice_tool>';
+
+function buildDicePool() {
+  const seq = (n, faces) => Array.from({ length: n }, () => crypto.randomInt(1, faces + 1)).join(', ');
+  const pool = `d20: ${seq(8, 20)}\nd12: ${seq(4, 12)}\nd10: ${seq(6, 10)}\nd8: ${seq(6, 8)}\nd6: ${seq(10, 6)}\nd4: ${seq(6, 4)}\nd100: ${seq(4, 100)}`;
+  return { pool, block: `\n\n<dice_pool>\n本轮如需骰点，必须按下列真随机序列从左到右依次消耗（用几个取几个，严禁跳选或自行编造点数），并在正文中如实呈现点数：\n${pool}\n</dice_pool>` };
+}
+
 // ---------- 提示构建 ----------
 function buildPrompt(body) {
   const messages = body.messages || [];
@@ -525,17 +585,19 @@ function buildPrompt(body) {
 }
 
 // ---------- SDK 调用 ----------
-async function* generate(model, systemPrompt, prompt, cwd, usageOut = {}) {
+async function* generate(model, systemPrompt, prompt, cwd, usageOut = {}, withDice = false) {
   const q = query({
     prompt,
     options: {
       model,
       systemPrompt,
-      allowedTools: [],
       settingSources: [],
-      maxTurns: 1,
       includePartialMessages: true,
       cwd,
+      // 掷骰工具启用时放开工具循环，其余场合保持纯单轮生成
+      ...(withDice
+        ? { mcpServers: { dice: diceServer }, allowedTools: ['mcp__dice__roll'], maxTurns: DICE_MAX_TURNS }
+        : { allowedTools: [], maxTurns: 1 }),
     },
   });
   for await (const msg of q) {
@@ -584,6 +646,22 @@ async function handleChat(req, res, body) {
   const cwd = campaign ? campaign.dir : MEMORY_ROOT;
   const usageOut = {};
   let full = '';
+
+  // 掷骰：按 system（预设+卡+世界书）中的规则关键词决定是否启用，非跑团场景零介入
+  let withDice = false;
+  const armed = diceArmed(baseSystem);
+  if (armed && DICE_MODE === 'tool') {
+    systemPrompt += DICE_TOOL_HINT;
+    withDice = true;
+  } else if (armed && DICE_MODE === 'pool') {
+    const { pool, block } = buildDicePool();
+    systemPrompt += block;
+    console.log(`[dice] 熵池注入:\n${pool.split('\n').map(l => '        ' + l).join('\n')}`);
+  }
+  if (campaign && campaign._diceState !== armed) {
+    campaign._diceState = armed;
+    if (armed) console.log(`[dice] ${campaign.id} 检测到规则关键词，掷骰已启用 (${DICE_MODE})`);
+  }
   try {
     if (stream) {
       res.writeHead(200, {
@@ -592,7 +670,7 @@ async function handleChat(req, res, body) {
         'Connection': 'keep-alive',
       });
       res.write(sseChunk(id, model, { role: 'assistant', content: '' }));
-      for await (const text of generate(model, systemPrompt, prompt, cwd, usageOut)) {
+      for await (const text of generate(model, systemPrompt, prompt, cwd, usageOut, withDice)) {
         full += text;
         res.write(sseChunk(id, model, { content: text }));
       }
@@ -600,7 +678,7 @@ async function handleChat(req, res, body) {
       res.write('data: [DONE]\n\n');
       res.end();
     } else {
-      for await (const text of generate(model, systemPrompt, prompt, cwd, usageOut)) full += text;
+      for await (const text of generate(model, systemPrompt, prompt, cwd, usageOut, withDice)) full += text;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         id, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
@@ -672,5 +750,6 @@ server.listen(PORT, '127.0.0.1', () => {
   const recallDesc = RECALL_MODE === 'off' ? 'off'
     : RECALL_MODE === 'api' ? `api(${RECALL_API_MODEL})` : `sdk(${RECALL_MODEL})`;
   const memoryDesc = MEMORY_MODE === 'api' ? `api(${MEMORY_API_MODEL})` : `sdk(${MEMORY_MODEL})`;
-  console.log(`st-claude-bridge listening on http://127.0.0.1:${PORT}/v1  (default: ${DEFAULT_MODEL}, memory: ${memoryDesc}, recall: ${recallDesc}, campaigns: ${campaigns.size}, root: ${MEMORY_ROOT})`);
+  const diceDesc = DICE_MODE === 'off' ? 'off' : `${DICE_MODE}/${DICE_TRIGGER}`;
+  console.log(`st-claude-bridge listening on http://127.0.0.1:${PORT}/v1  (default: ${DEFAULT_MODEL}, memory: ${memoryDesc}, recall: ${recallDesc}, dice: ${diceDesc}, campaigns: ${campaigns.size}, root: ${MEMORY_ROOT})`);
 });
