@@ -272,32 +272,32 @@ const MEMORY_FILE_SPEC = [
   '- world_state.md：时间/地点/天气/当前任务与目标',
   '- party.md：队伍成员的 HP、状态、装备、金钱账本',
   '- npc_ledger.md：出场 NPC 的态度、承诺、已知信息',
-  '- timeline.md：按事件压缩的编年史（追加，不重写历史）',
+  '- timeline.md：按事件压缩的编年史（追加，不重写历史；每条事件末尾标注来源轮号如（#12-13），合并压缩旧条目时保留合并后的轮号范围——轮号是日后按号回捞原文的指针，不可丢弃）',
   '- foreshadowing.md：未回收的伏笔与悬念',
 ];
 const MEMORY_RULES = '只记录本轮新增或变化的信息；保持每个文件精炼（超过约 200 行时压缩旧内容）。聊天原文中的变量标记、状态栏/前端代码、思维链推演等非叙事内容一律不要写入档案，只提炼其中的叙事事实。';
 const MEMORY_MD_FILES = ['world_state.md', 'party.md', 'npc_ledger.md', 'timeline.md', 'foreshadowing.md'];
 
-function memoryExchangeBlock(lastUserText, replyText, notes) {
+function memoryExchangeBlock(lastUserText, replyText, notes, replyNo) {
   return [
     ...(notes.length
       ? ['<corrections>', '以下修正优先处理：', ...notes, '</corrections>', '']
       : []),
-    '<latest_user_turn>', lastUserText.slice(0, 8000), '</latest_user_turn>',
-    '<latest_reply>', replyText.slice(0, 16000), '</latest_reply>',
+    `<latest_user_turn 轮号="#${replyNo - 1}">`, lastUserText.slice(0, 8000), '</latest_user_turn>',
+    `<latest_reply 轮号="#${replyNo}">`, replyText.slice(0, 16000), '</latest_reply>',
   ].join('\n');
 }
 
 // sdk 模式：agent 带文件工具在战役目录内增量编辑
-async function updateMemorySdk(campaign, lastUserText, replyText, notes, startedAt) {
+async function updateMemorySdk(campaign, lastUserText, replyText, notes, startedAt, replyNo) {
   const prompt = [
     '你是战役记忆管理器。根据下面这一轮最新交互，更新当前目录下的战役档案（Markdown 文件）。',
     '维护这些文件（不存在则创建）：',
     ...MEMORY_FILE_SPEC,
     MEMORY_RULES,
-    '完整对话原文在 transcript.jsonl（每行一条 JSON，只读，不要修改它和 meta.json），需要核对旧细节时可用 Read/Grep 查证。',
+    '完整对话原文在 transcript.jsonl（每行一条 JSON，行号即轮号 #N，只读，不要修改它和 meta.json），需要核对旧细节时可用 Read/Grep 查证。',
     '',
-    memoryExchangeBlock(lastUserText, replyText, notes),
+    memoryExchangeBlock(lastUserText, replyText, notes, replyNo),
   ].join('\n');
 
   for await (const msg of query({
@@ -321,7 +321,7 @@ async function updateMemorySdk(campaign, lastUserText, replyText, notes, started
 }
 
 // api 模式：单轮"全文件重写"——现有档案+本轮交互进，需更新文件的全文出，桥负责落盘
-async function updateMemoryApi(campaign, lastUserText, replyText, notes, startedAt) {
+async function updateMemoryApi(campaign, lastUserText, replyText, notes, startedAt, replyNo) {
   const current = MEMORY_MD_FILES.map(f => {
     const p = path.join(campaign.dir, f);
     const text = fs.existsSync(p) ? fs.readFileSync(p, 'utf8').slice(0, 12000) : '（尚不存在）';
@@ -333,7 +333,7 @@ async function updateMemoryApi(campaign, lastUserText, replyText, notes, started
     MEMORY_RULES,
     '输出格式：仅输出有变化的文件；每个文件以单独一行 ===FILE: 文件名=== 开头，紧跟该文件更新后的完整内容；除此之外不要输出任何解释。若本轮无需任何更新，只输出 NO_UPDATE。',
   ].join('\n');
-  const prompt = `<current_files>\n${current}\n</current_files>\n\n${memoryExchangeBlock(lastUserText, replyText, notes)}`;
+  const prompt = `<current_files>\n${current}\n</current_files>\n\n${memoryExchangeBlock(lastUserText, replyText, notes, replyNo)}`;
 
   const { text: out, usage } = await openaiChat({ url: MEMORY_API_URL, key: MEMORY_API_KEY, model: MEMORY_API_MODEL }, system, prompt);
   const tag = trackUsage('memory', campaign, usage);
@@ -364,9 +364,12 @@ async function updateMemory(campaign, lastUserText, replyText) {
   campaign.memoryJobRunning = true;
   const notes = campaign.pendingNotes.splice(0);
   const startedAt = Date.now();
+  // 回复刚被 push 进 transcript，其 1-based 轮号即当前长度；极端和解（整体替换）可能
+  // 让旧轮号漂移，属可接受误差——轮号指针是尽力而为的导航，不是强一致索引。
+  const replyNo = campaign.transcript.length;
   try {
-    if (MEMORY_MODE === 'api') await updateMemoryApi(campaign, lastUserText, replyText, notes, startedAt);
-    else await updateMemorySdk(campaign, lastUserText, replyText, notes, startedAt);
+    if (MEMORY_MODE === 'api') await updateMemoryApi(campaign, lastUserText, replyText, notes, startedAt, replyNo);
+    else await updateMemorySdk(campaign, lastUserText, replyText, notes, startedAt, replyNo);
     saveCampaign(campaign); // 持久化 meta 里的用量累计
   } catch (e) {
     campaign.pendingNotes.unshift(...notes); // 失败不丢修正，下一轮补上
@@ -418,12 +421,25 @@ const withTimeout = (p, ms, tag) => Promise.race([
   p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${tag} 超时 (${ms}ms)`)), ms)),
 ]);
 
-// 进程内检索：只扫提示词窗口之外的早期轮次，命中轮附带前后各一轮上下文
-function searchArchive(campaign, queries) {
+// 进程内检索：只扫提示词窗口之外的早期轮次，命中轮附带前后各一轮上下文。
+// turnSpecs 为轮号指针（"12" 或 "30-35"，对应 timeline 里的 #N 标注），直接按号取原文，
+// 是关键词逐字匹配不到时的兜底导航。
+function searchArchive(campaign, queries, turnSpecs = []) {
   const t = campaign.transcript;
   const searchable = Math.max(0, t.length - RECENT_TURNS);
   if (!searchable) return [];
   const hit = new Set();
+  for (const spec of turnSpecs) {
+    const m = String(spec).match(/^#?\s*(\d+)(?:\s*[-~～—]\s*#?(\d+))?$/);
+    if (!m) continue;
+    let a = Number(m[1]), b = Number(m[2] || m[1]);
+    if (b < a) [a, b] = [b, a];
+    b = Math.min(b, a + 19); // 单个范围最多展开 20 轮，防误写大范围；总量仍受 RECALL_BUDGET 截断
+    for (let n = a; n <= b; n++) {
+      const i = n - 1; // 轮号 1-based → 数组下标
+      if (i >= 0 && i < searchable) hit.add(i);
+    }
+  }
   for (const q of queries) {
     const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
     for (let i = 0; i < searchable; i++) {
@@ -451,22 +467,28 @@ async function runRecall(campaign, lastUserText) {
   const timeline = fs.existsSync(timelinePath)
     ? fs.readFileSync(timelinePath, 'utf8').slice(-3000)
     : '（暂无编年史）';
-  const qSystem = '你是对话归档检索助手。根据剧情编年史和最新一条消息，判断这一轮是否需要从早期对话原文中查证旧细节（旧承诺、旧台词、具体数字、名字对应关系等）。只输出严格 JSON，不要输出任何其他内容：需要时 {"queries":["关键词1","关键词2"]}（1-4 个）；不需要时 {"queries":[]}。检索方式是对原文逐字匹配，因此关键词必须是可能在原文中原样出现的词形：单个人名、地名、物品名、独特称谓或短语。禁止把多个概念拼成话题概括（要"赫克"，不要"赫克评估主角"）；同一名字疑有多种写法时，可让每种写法各占一个关键词。';
+  const qSystem = '你是对话归档检索助手。根据剧情编年史和最新一条消息，判断这一轮是否需要从早期对话原文中查证旧细节（旧承诺、旧台词、具体数字、名字对应关系等）。只输出严格 JSON，不要输出任何其他内容：需要时 {"queries":["关键词1"],"turns":["12","30-35"]}（两个字段各 0-4 个，至少一个字段非空）；不需要时 {"queries":[]}。queries 的检索方式是对原文逐字匹配，因此关键词必须是可能在原文中原样出现的词形：单个人名、地名、物品名、独特称谓或短语。禁止把多个概念拼成话题概括（要"赫克"，不要"赫克评估主角"）；同一名字疑有多种写法时，可让每种写法各占一个关键词。turns 是编年史事件末尾标注的轮号（#N）或轮号范围，当相关事件在编年史里标了轮号、尤其是难以给出逐字关键词时，用它直接按号调取原文。';
   const gen = await completeText(qSystem,
     `<timeline>\n${timeline}\n</timeline>\n\n<latest_message>\n${lastUserText.slice(0, 2000)}\n</latest_message>`);
   let tag = trackUsage('recall', campaign, gen.usage);
   const m = gen.text.match(/\{[\s\S]*\}/);
   if (!m) { console.log(`[recall] ${campaign.id} 检索词解析失败，跳过${tag}`); return ''; }
-  let queries;
-  try { queries = JSON.parse(m[0]).queries || []; } catch { return ''; }
+  let queries, turnSpecs;
+  try {
+    const parsed = JSON.parse(m[0]);
+    queries = Array.isArray(parsed.queries) ? parsed.queries : [];
+    turnSpecs = Array.isArray(parsed.turns) ? parsed.turns : [];
+  } catch { return ''; }
   queries = queries.filter(q => typeof q === 'string' && q.trim()).slice(0, 4);
-  if (!queries.length) {
+  turnSpecs = turnSpecs.map(s => String(s).trim()).filter(Boolean).slice(0, 4);
+  if (!queries.length && !turnSpecs.length) {
     console.log(`[recall] ${campaign.id} 判定无需检索 (${Date.now() - started}ms)${tag}`);
     return '';
   }
-  const lines = searchArchive(campaign, queries);
+  const label = [...queries, ...turnSpecs.map(s => `#${s.replace(/^#/, '')}`)].join('、');
+  const lines = searchArchive(campaign, queries, turnSpecs);
   if (!lines.length) {
-    console.log(`[recall] ${campaign.id} 检索 [${queries.join('、')}] 无命中 (${Date.now() - started}ms)${tag}`);
+    console.log(`[recall] ${campaign.id} 检索 [${label}] 无命中 (${Date.now() - started}ms)${tag}`);
     return '';
   }
   let content = lines.join('\n');
@@ -477,7 +499,7 @@ async function runRecall(campaign, lastUserText) {
     content = syn.text;
     tag += trackUsage('recall', campaign, syn.usage);
   }
-  console.log(`[recall] ${campaign.id} 检索 [${queries.join('、')}] 命中 ${lines.length} 段，注入 ${content.length} 字符 (${Date.now() - started}ms)${tag}`);
+  console.log(`[recall] ${campaign.id} 检索 [${label}] 命中 ${lines.length} 段，注入 ${content.length} 字符 (${Date.now() - started}ms)${tag}`);
   return `\n\n<archive_recall>\n以下是根据本轮话题从对话原文归档中检索到的早期内容（#N 为轮号），可用于核对旧细节：\n${content}\n</archive_recall>`;
 }
 
