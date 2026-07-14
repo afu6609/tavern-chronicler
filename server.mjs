@@ -275,7 +275,7 @@ const MEMORY_FILE_SPEC = [
   '- timeline.md：按事件压缩的编年史（追加，不重写历史；每条事件末尾标注来源轮号如（#12-13），合并压缩旧条目时保留合并后的轮号范围——轮号是日后按号回捞原文的指针，不可丢弃）',
   '- foreshadowing.md：未回收的伏笔与悬念',
 ];
-const MEMORY_RULES = '只记录本轮新增或变化的信息；保持每个文件精炼（超过约 200 行时压缩旧内容）。聊天原文中的变量标记、状态栏/前端代码、思维链推演等非叙事内容一律不要写入档案，只提炼其中的叙事事实。';
+const MEMORY_RULES = '只记录本轮新增或变化的信息；保持每个文件精炼（超过约 200 行时压缩旧内容）。聊天原文中的变量标记、状态栏/前端代码、思维链推演等非叙事内容一律不要写入档案，只提炼其中的叙事事实。本轮交互的轮号已在交互块属性中直接给出，新条目照抄即可；不要重复核对、改写既有条目的轮号标注，也不要为校验轮号去通读 transcript——每轮更新应当只围绕本轮新信息，快进快出。';
 const MEMORY_MD_FILES = ['world_state.md', 'party.md', 'npc_ledger.md', 'timeline.md', 'foreshadowing.md'];
 
 function memoryExchangeBlock(lastUserText, replyText, notes, replyNo) {
