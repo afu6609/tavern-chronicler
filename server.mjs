@@ -451,7 +451,7 @@ async function runRecall(campaign, lastUserText) {
   const timeline = fs.existsSync(timelinePath)
     ? fs.readFileSync(timelinePath, 'utf8').slice(-3000)
     : '（暂无编年史）';
-  const qSystem = '你是对话归档检索助手。根据剧情编年史和最新一条消息，判断这一轮是否需要从早期对话原文中查证旧细节（旧承诺、旧台词、具体数字、名字对应关系等）。只输出严格 JSON，不要输出任何其他内容：需要时 {"queries":["关键词1","关键词2"]}（1-4 个具体的名字/物品/地点/事件关键词，不要整句）；不需要时 {"queries":[]}。';
+  const qSystem = '你是对话归档检索助手。根据剧情编年史和最新一条消息，判断这一轮是否需要从早期对话原文中查证旧细节（旧承诺、旧台词、具体数字、名字对应关系等）。只输出严格 JSON，不要输出任何其他内容：需要时 {"queries":["关键词1","关键词2"]}（1-4 个）；不需要时 {"queries":[]}。检索方式是对原文逐字匹配，因此关键词必须是可能在原文中原样出现的词形：单个人名、地名、物品名、独特称谓或短语。禁止把多个概念拼成话题概括（要"赫克"，不要"赫克评估主角"）；同一名字疑有多种写法时，可让每种写法各占一个关键词。';
   const gen = await completeText(qSystem,
     `<timeline>\n${timeline}\n</timeline>\n\n<latest_message>\n${lastUserText.slice(0, 2000)}\n</latest_message>`);
   let tag = trackUsage('recall', campaign, gen.usage);
