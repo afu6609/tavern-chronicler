@@ -65,6 +65,7 @@ node server.mjs
 | `MEMORY_MAX_TURNS` | `30` | 记忆 agent（sdk 模式）的最大工具回合数，长回复大档案可适当调高 |
 | `MEMORY_ROOT` | `./memory` | 战役档案根目录 |
 | `RECENT_TURNS` | `40` | 正文携带的最近对话轮数；更早的历史由战役档案接管 |
+| `RECENT_TURNS_MAX` | `0`（关闭） | 窗口锚定模式：设为大于 `RECENT_TURNS` 的值后，窗口起点固定、正文纯追加（前缀缓存跨轮存活），涨到该上限才一次性收缩回 `RECENT_TURNS`。仅在两轮间隔小于缓存寿命（5 分钟）的快节奏对话中有收益，慢节奏对话请保持关闭 |
 | `CONTINUE_PROMPT` | 中性续写指令 | 拼在 prompt 末尾的续写指令。默认不指定任何身份/视角（多角色、多人称、旁白式预设均不受干预），仅要求衔接上文自然续写；需要强制某种视角时可自行覆盖 |
 | `RECALL_MODE` | `sdk` | 定向回溯后端：`sdk`（走 Claude Code 订阅）/ `api`（自配 OpenAI 兼容端点）/ `off` |
 | `RECALL_MODEL` | `claude-haiku-4-5-20251001` | sdk 模式用的模型 |

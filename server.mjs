@@ -53,6 +53,10 @@ const MEMORY_MAX_TURNS = Number(process.env.MEMORY_MAX_TURNS || 30);
 const MEMORY_ROOT = process.env.MEMORY_ROOT || path.join(ROOT, 'memory');
 const CAMPAIGNS_ROOT = path.join(MEMORY_ROOT, 'campaigns');
 const RECENT_TURNS = Number(process.env.RECENT_TURNS || 40); // 保留的最近对话轮数，更早的靠记忆文件
+// 窗口锚定（默认关闭）：设 RECENT_TURNS_MAX > RECENT_TURNS 启用。锚定后窗口起点固定、
+// 正文纯追加（前缀缓存不失效），涨到上限才一次性收缩回 RECENT_TURNS。只在两轮间隔
+// 小于缓存寿命（5 分钟）的快节奏对话中有收益；慢节奏对话徒增窗口体积，保持关闭。
+const RECENT_TURNS_MAX = Number(process.env.RECENT_TURNS_MAX || 0);
 // 推理力度（仅 SDK 模式生效）：low | medium | high | xhigh | max，未设置时跟随 SDK 默认（high）。
 // RECALL_EFFORT 默认 low：提取检索词是机械任务，深度思考只烧 token、拖慢管道。
 const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
@@ -439,7 +443,7 @@ const withTimeout = (p, ms, tag) => Promise.race([
 // 是关键词逐字匹配不到时的兜底导航。
 function searchArchive(campaign, queries, turnSpecs = []) {
   const t = campaign.transcript;
-  const searchable = Math.max(0, t.length - RECENT_TURNS);
+  const searchable = Math.max(0, campaign._searchableTo ?? (t.length - RECENT_TURNS));
   if (!searchable) return [];
   const hit = new Set();
   for (const spec of turnSpecs) {
@@ -481,7 +485,7 @@ async function runRecall(campaign, lastUserText) {
     ? fs.readFileSync(timelinePath, 'utf8').slice(-3000)
     : '（暂无编年史）';
   const qSystem = '你是对话归档检索助手。根据剧情编年史和最新一条消息，判断这一轮是否需要从早期对话原文中查证旧细节（旧承诺、旧台词、具体数字、名字对应关系等）。只输出严格 JSON，不要输出任何其他内容：需要时 {"queries":["关键词1"],"turns":["12","30-35"]}（两个字段各 0-4 个，至少一个字段非空）；不需要时 {"queries":[]}。queries 的检索方式是对原文逐字匹配，因此关键词必须是可能在原文中原样出现的词形：单个人名、地名、物品名、独特称谓或短语。禁止把多个概念拼成话题概括（要"赫克"，不要"赫克评估主角"）；同一名字疑有多种写法时，可让每种写法各占一个关键词。turns 是编年史事件末尾标注的轮号（#N）或轮号范围，当相关事件在编年史里标了轮号、尤其是难以给出逐字关键词时，用它直接按号调取原文。注意 <searchable_range> 给出的归档边界：边界之后的轮次已在当前对话正文中、无需也无法检索，若所需信息全部在边界之后，直接输出 {"queries":[]}。';
-  const searchableTo = Math.max(0, campaign.transcript.length - RECENT_TURNS);
+  const searchableTo = Math.max(0, campaign._searchableTo ?? (campaign.transcript.length - RECENT_TURNS));
   const gen = await completeText(qSystem,
     `<searchable_range>\n归档可检索范围：#1 至 #${searchableTo}（#${searchableTo + 1} 起的轮次已在当前对话正文中）\n</searchable_range>\n\n<timeline>\n${timeline}\n</timeline>\n\n<latest_message>\n${lastUserText.slice(0, 2000)}\n</latest_message>`);
   let tag = trackUsage('recall', campaign, gen.usage);
@@ -620,9 +624,20 @@ function buildPrompt(body) {
     saveCampaign(campaign);
   }
 
-  // 历史截断：早期对话交给记忆档案，正文只带最近 N 轮
-  const recent = turns.slice(-RECENT_TURNS);
-  const dropped = turns.length - recent.length;
+  // 历史截断：早期对话交给记忆档案。默认滑动窗口（永远最近 N 轮）；
+  // 启用锚定后窗口起点固定、只在超出上限时收缩，其余轮次正文为纯追加。
+  let start = Math.max(0, turns.length - RECENT_TURNS);
+  if (campaign && RECENT_TURNS_MAX > RECENT_TURNS) {
+    let anchor = campaign.meta.windowAnchor;
+    if (!Number.isInteger(anchor) || anchor < 0 || anchor > start) anchor = start;
+    if (turns.length - anchor > RECENT_TURNS_MAX) anchor = start; // 超上限，一次性收缩
+    campaign.meta.windowAnchor = anchor;
+    start = anchor;
+  }
+  const recent = turns.slice(start);
+  const dropped = start;
+  // 回溯的可检索边界跟随实际窗口起点，锚定期间不留"既不在窗口也搜不到"的缝隙
+  if (campaign) campaign._searchableTo = dropped;
   const transcriptText = recent
     .map(t => (t.role === 'assistant' ? `[assistant]\n${t.content}` : `[user]\n${t.content}`))
     .join('\n\n');
@@ -690,7 +705,8 @@ async function handleChat(req, res, body) {
   const { campaign, systemPrompt: baseSystem, prompt, lastUserText } = buildPrompt(body);
   let systemPrompt = baseSystem;
   let promptTail = ''; // 回溯/骰池等每轮易变的注入统一后置，保住前缀缓存
-  if (RECALL_MODE !== 'off' && campaign && campaign.transcript.length > RECENT_TURNS && lastUserText) {
+  if (RECALL_MODE !== 'off' && campaign && lastUserText
+      && (campaign._searchableTo ?? (campaign.transcript.length - RECENT_TURNS)) > 0) {
     try {
       promptTail += await withTimeout(runRecall(campaign, lastUserText), RECALL_TIMEOUT, 'recall');
     } catch (e) {
