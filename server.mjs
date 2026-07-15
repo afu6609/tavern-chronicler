@@ -10,11 +10,37 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
+import { WebSocketServer } from 'ws';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 9377);
+const MEMORY_ROOT = process.env.MEMORY_ROOT || path.join(ROOT, 'memory');
+const CAMPAIGNS_ROOT = path.join(MEMORY_ROOT, 'campaigns');
+fs.mkdirSync(CAMPAIGNS_ROOT, { recursive: true });
 
-// 可选模型（全名）。ST 界面里选哪个，请求就用哪个；未选或不认识时回退到 DEFAULT_MODEL。
+// ---------- 日志环形缓冲与广播 ----------
+// console 输出照常打到控制台，同时进环形缓冲并推给管理面板（ST 扩展）；
+// 面板连上时先回放缓冲，之后实时接收。
+const LOG_RING_MAX = 400;
+const logRing = [];
+const adminClients = new Set();
+function broadcastAdmin(obj) {
+  if (!adminClients.size) return;
+  const s = JSON.stringify(obj);
+  for (const c of adminClients) if (c.readyState === 1) c.send(s);
+}
+for (const level of ['log', 'warn', 'error']) {
+  const orig = console[level].bind(console);
+  console[level] = (...args) => {
+    orig(...args);
+    const text = args.map(a => (typeof a === 'string' ? a : a?.stack || String(a))).join(' ');
+    logRing.push({ type: 'log', level, text, ts: Date.now() });
+    if (logRing.length > LOG_RING_MAX) logRing.shift();
+    broadcastAdmin(logRing[logRing.length - 1]);
+  };
+}
+
+// 可选模型（全名）。ST 界面里选哪个，请求就用哪个；未选或不认识时回退到默认模型。
 const MODELS = [
   'claude-fable-5',
   'claude-opus-4-8',
@@ -35,43 +61,135 @@ const MODELS = [
   'claude-sonnet-4-5[1m]',
   'claude-sonnet-4-0',
 ];
-const DEFAULT_MODEL = process.env.BRIDGE_MODEL || 'claude-sonnet-5';
-// 记忆更新任务用的模型（默认与回复模型解耦，可用便宜些的档位）
-const MEMORY_MODEL = process.env.MEMORY_MODEL || DEFAULT_MODEL;
-// 记忆后端：sdk = Agent SDK 带文件工具的增量编辑；api = 自配 OpenAI 兼容端点，
-// 走"全文件重写"协议（档案现文+本轮交互 → 输出需更新文件的全文），不依赖工具调用能力。
-let MEMORY_MODE = (process.env.MEMORY_MODE || 'sdk').toLowerCase(); // sdk | api
-const MEMORY_API_URL = (process.env.MEMORY_API_URL || '').replace(/\/+$/, '');
-const MEMORY_API_KEY = process.env.MEMORY_API_KEY || '';
-const MEMORY_API_MODEL = process.env.MEMORY_API_MODEL || '';
-if (MEMORY_MODE === 'api' && (!MEMORY_API_URL || !MEMORY_API_MODEL)) {
-  console.warn('[memory] MEMORY_MODE=api 但缺少 MEMORY_API_URL / MEMORY_API_MODEL，回退到 sdk');
-  MEMORY_MODE = 'sdk';
+// ---------- 运行时配置 ----------
+// 优先级：memory/bridge-config.json（管理面板修改，持久化）> 环境变量 > 内置默认。
+// 除 PORT / MEMORY_ROOT（进程生命周期内固定）外全部热生效：改完下一轮请求即用新值。
+// schema 同时驱动校验与面板表单渲染，加配置项只改这一处。
+const CONFIG_FILE = path.join(MEMORY_ROOT, 'bridge-config.json');
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+// type: int | str | enum；lower=存前转小写；secret=面板打码；multiline=面板用多行框；
+// enum 的 values 里 '' 表示"跟随默认/不设置"。
+const CONFIG_SCHEMA = {
+  BRIDGE_MODEL: { group: '模型', label: '默认回复模型', type: 'enum', values: MODELS, def: 'claude-sonnet-5',
+    desc: 'ST 未指定或指定了未知模型时使用' },
+  CHAT_EFFORT: { group: '模型', label: '回复推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: '',
+    desc: '空 = 跟随 SDK 默认（high）。低档出字快、消耗低，高档叙事更深' },
+  CONTINUE_PROMPT: { group: '模型', label: '续写指令', type: 'str', multiline: true,
+    def: '衔接 transcript 最后一条消息，遵循 system 中的全部设定（包括视角、人称、文风与角色分配），自然地续写下一条回复。只输出回复正文，不要输出任何解释或前缀。',
+    desc: '拼在每次请求末尾的中性续写指令，视角/人称交给预设决定' },
+
+  RECENT_TURNS: { group: '窗口', label: '窗口轮数', type: 'int', min: 1, def: 40,
+    desc: '正文保留的最近对话轮数，更早的靠记忆档案与回溯' },
+  RECENT_TURNS_MAX: { group: '窗口', label: '锚定窗口上限', type: 'int', min: 0, def: 0,
+    desc: '0=关闭。设为大于窗口轮数启用锚定：窗口起点固定、正文纯追加省缓存，涨到上限一次性收缩。只在两轮间隔小于缓存寿命（5 分钟）的快节奏对话中有收益' },
+
+  RECALL_MODE: { group: '回溯', label: '回溯模式', type: 'enum', values: ['sdk', 'api', 'off'], lower: true, def: 'sdk' },
+  RECALL_MODEL: { group: '回溯', label: '出词模型', type: 'str', def: 'claude-haiku-4-5-20251001',
+    desc: 'sdk 模式下出词与压缩用的模型' },
+  RECALL_EFFORT: { group: '回溯', label: '出词推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: 'low',
+    desc: '出词是机械任务，低档即可' },
+  RECALL_THINKING_BUDGET: { group: '回溯', label: '出词思考上限', type: 'int', min: 0, def: 2000,
+    desc: '思考 token 硬上限，防止回忆密集轮长考超时；0=不设限的自适应' },
+  RECALL_BUDGET: { group: '回溯', label: '注入字符预算', type: 'int', min: 500, def: 6000 },
+  RECALL_TIMEOUT: { group: '回溯', label: '超时 (ms)', type: 'int', min: 1000, def: 30000,
+    desc: '整个回溯的超时，超时放弃不阻塞回复；命中多时要两次调用，建议 ≥ 90000' },
+  RECALL_API_URL: { group: '回溯', label: 'API 地址', type: 'str', def: '', desc: 'api 模式的 OpenAI 兼容端点' },
+  RECALL_API_KEY: { group: '回溯', label: 'API 密钥', type: 'str', secret: true, def: '' },
+  RECALL_API_MODEL: { group: '回溯', label: 'API 模型', type: 'str', def: '' },
+
+  MEMORY_MODE: { group: '记忆', label: '记忆模式', type: 'enum', values: ['sdk', 'api'], lower: true, def: 'sdk',
+    desc: 'sdk=agent 带文件工具增量编辑；api=自配端点全文件重写' },
+  MEMORY_MODEL: { group: '记忆', label: '记忆模型', type: 'str', def: '', desc: '空 = 跟随默认回复模型（sdk 模式）' },
+  MEMORY_EFFORT: { group: '记忆', label: '记忆推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: '',
+    desc: '空 = 跟随 SDK 默认（high）；medium 可显著缩短更新耗时' },
+  MEMORY_MAX_TURNS: { group: '记忆', label: '工具回合上限', type: 'int', min: 4, def: 30,
+    desc: '记忆 agent 的最大工具回合数，长回复+5文件读写实测可超 15' },
+  MEMORY_API_URL: { group: '记忆', label: 'API 地址', type: 'str', def: '' },
+  MEMORY_API_KEY: { group: '记忆', label: 'API 密钥', type: 'str', secret: true, def: '' },
+  MEMORY_API_MODEL: { group: '记忆', label: 'API 模型', type: 'str', def: '' },
+
+  DICE_MODE: { group: '掷骰', label: '掷骰模式', type: 'enum', values: ['tool', 'pool', 'off'], lower: true, def: 'tool',
+    desc: 'tool=真随机掷骰工具（推荐）；pool=预掷熵池注入' },
+  DICE_TRIGGER: { group: '掷骰', label: '触发方式', type: 'enum', values: ['auto', 'always'], lower: true, def: 'auto',
+    desc: 'auto=检测到规则关键词才启用，非跑团场景零介入' },
+  DICE_MAX_TURNS: { group: '掷骰', label: '工具回合上限', type: 'int', min: 2, def: 6,
+    desc: 'tool 模式下回复 agent 的回合上限，多次检定的战斗轮建议 ≥ 10' },
+};
+
+function normalizeConfig(key, raw) {
+  const s = CONFIG_SCHEMA[key];
+  if (!s) return { err: `未知配置项 ${key}` };
+  if (s.type === 'int') {
+    const n = Math.floor(Number(raw));
+    if (!Number.isFinite(n) || n < (s.min ?? 0)) return { err: `需要 ≥ ${s.min ?? 0} 的整数` };
+    return { value: n };
+  }
+  let v = String(raw ?? '').trim();
+  if (s.lower) v = v.toLowerCase();
+  if (key.endsWith('_API_URL')) v = v.replace(/\/+$/, '');
+  if (s.type === 'enum' && !s.values.includes(v)) {
+    return { err: `可选值: ${s.values.map(x => x || '(空)').join(' | ')}` };
+  }
+  return { value: v };
 }
-// 记忆 agent 的最大工具回合数：真实卡的长回复+5文件读写实测可超 15，放宽默认值
-const MEMORY_MAX_TURNS = Number(process.env.MEMORY_MAX_TURNS || 30);
-const MEMORY_ROOT = process.env.MEMORY_ROOT || path.join(ROOT, 'memory');
-const CAMPAIGNS_ROOT = path.join(MEMORY_ROOT, 'campaigns');
-const RECENT_TURNS = Number(process.env.RECENT_TURNS || 40); // 保留的最近对话轮数，更早的靠记忆文件
-// 窗口锚定（默认关闭）：设 RECENT_TURNS_MAX > RECENT_TURNS 启用。锚定后窗口起点固定、
-// 正文纯追加（前缀缓存不失效），涨到上限才一次性收缩回 RECENT_TURNS。只在两轮间隔
-// 小于缓存寿命（5 分钟）的快节奏对话中有收益；慢节奏对话徒增窗口体积，保持关闭。
-const RECENT_TURNS_MAX = Number(process.env.RECENT_TURNS_MAX || 0);
-// 推理力度（仅 SDK 模式生效）：low | medium | high | xhigh | max，未设置时跟随 SDK 默认（high）。
-// RECALL_EFFORT 默认 low：提取检索词是机械任务，深度思考只烧 token、拖慢管道。
-const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
-function effortOf(name, dflt = '') {
-  const v = (process.env[name] || dflt).toLowerCase();
-  if (v && !EFFORT_LEVELS.has(v)) console.warn(`[config] ${name}=${v} 不是有效推理等级，已忽略`);
-  return EFFORT_LEVELS.has(v) ? v : undefined;
+
+const CFG = {};
+let fileConfig = {};
+try { fileConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { fileConfig = {}; }
+if (typeof fileConfig !== 'object' || fileConfig === null || Array.isArray(fileConfig)) fileConfig = {};
+for (const key of Object.keys(CONFIG_SCHEMA)) {
+  let v = CONFIG_SCHEMA[key].def;
+  const envRaw = process.env[key];
+  if (envRaw !== undefined && envRaw !== '') {
+    const r = normalizeConfig(key, envRaw);
+    if (r.err) console.warn(`[config] 环境变量 ${key}=${envRaw} 无效（${r.err}），已忽略`);
+    else v = r.value;
+  }
+  if (Object.hasOwn(fileConfig, key)) {
+    const r = normalizeConfig(key, fileConfig[key]);
+    if (r.err) console.warn(`[config] bridge-config.json 的 ${key} 无效（${r.err}），已忽略`);
+    else v = r.value;
+  }
+  CFG[key] = v;
 }
-const CHAT_EFFORT = effortOf('CHAT_EFFORT');
-const RECALL_EFFORT = effortOf('RECALL_EFFORT', 'low');
-const MEMORY_EFFORT = effortOf('MEMORY_EFFORT');
-// 结尾续写指令。默认保持中性：视角/人称/角色分配完全交给预设决定，桥不越权指定身份。
-const CONTINUE_PROMPT = process.env.CONTINUE_PROMPT
-  || '衔接 transcript 最后一条消息，遵循 system 中的全部设定（包括视角、人称、文风与角色分配），自然地续写下一条回复。只输出回复正文，不要输出任何解释或前缀。';
-fs.mkdirSync(CAMPAIGNS_ROOT, { recursive: true });
+
+// 面板改值入口：校验 → 热生效 → 持久化到 bridge-config.json → 广播给所有面板
+function setConfig(key, raw) {
+  const r = normalizeConfig(key, raw);
+  if (r.err) return r;
+  CFG[key] = r.value;
+  fileConfig[key] = r.value;
+  try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(fileConfig, null, 2) + '\n'); }
+  catch (e) { console.warn(`[config] bridge-config.json 写入失败: ${e.message}`); }
+  console.log(`[config] ${key} = ${CONFIG_SCHEMA[key].secret ? '（已隐藏）' : JSON.stringify(r.value)}（面板修改，即时生效）`);
+  broadcastAdmin({ type: 'config', config: publicConfig() });
+  return { value: r.value };
+}
+
+// 发给面板的配置快照（密钥打码，真实值只进不出）
+function publicConfig() {
+  const out = {};
+  for (const [k, s] of Object.entries(CONFIG_SCHEMA)) out[k] = s.secret ? (CFG[k] ? '••••••' : '') : CFG[k];
+  return out;
+}
+
+// api 后端配置不全时的兜底判定（配置可热改，故在使用时校验而非启动时）
+function memoryModeNow() {
+  if (CFG.MEMORY_MODE !== 'api') return 'sdk';
+  if (!CFG.MEMORY_API_URL || !CFG.MEMORY_API_MODEL) {
+    console.warn('[memory] MEMORY_MODE=api 但缺少 MEMORY_API_URL / MEMORY_API_MODEL，本轮回退 sdk');
+    return 'sdk';
+  }
+  return 'api';
+}
+function recallModeNow() {
+  if (CFG.RECALL_MODE === 'api' && (!CFG.RECALL_API_URL || !CFG.RECALL_API_MODEL)) {
+    console.warn('[recall] RECALL_MODE=api 但缺少 RECALL_API_URL / RECALL_API_MODEL，本轮跳过回溯');
+    return 'off';
+  }
+  return CFG.RECALL_MODE;
+}
 
 // ---------- 用量统计 ----------
 const START_TS = Date.now();
@@ -314,13 +432,13 @@ async function updateMemorySdk(campaign, lastUserText, replyText, notes, started
   for await (const msg of query({
     prompt,
     options: {
-      model: MEMORY_MODEL,
+      model: CFG.MEMORY_MODEL || CFG.BRIDGE_MODEL,
       cwd: campaign.dir,
       allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep'],
       permissionMode: 'acceptEdits',
       settingSources: [],
-      maxTurns: MEMORY_MAX_TURNS,
-      ...(MEMORY_EFFORT ? { effort: MEMORY_EFFORT } : {}),
+      maxTurns: CFG.MEMORY_MAX_TURNS,
+      ...(CFG.MEMORY_EFFORT ? { effort: CFG.MEMORY_EFFORT } : {}),
     },
   })) {
     if (msg.type === 'result') {
@@ -346,7 +464,7 @@ async function updateMemoryApi(campaign, lastUserText, replyText, notes, started
   ].join('\n');
   const prompt = `<current_files>\n${current}\n</current_files>\n\n${memoryExchangeBlock(lastUserText, replyText, notes, replyNo)}`;
 
-  const { text: out, usage } = await openaiChat({ url: MEMORY_API_URL, key: MEMORY_API_KEY, model: MEMORY_API_MODEL }, system, prompt);
+  const { text: out, usage } = await openaiChat({ url: CFG.MEMORY_API_URL, key: CFG.MEMORY_API_KEY, model: CFG.MEMORY_API_MODEL }, system, prompt);
   const tag = trackUsage('memory', campaign, usage);
   if (/^\s*NO_UPDATE\b/.test(out.trim())) {
     console.log(`[memory] ${campaign.id} 判定无需更新 (api, ${((Date.now() - startedAt) / 1000).toFixed(1)}s)${tag}`);
@@ -379,7 +497,7 @@ async function updateMemory(campaign, lastUserText, replyText) {
   // 让旧轮号漂移，属可接受误差——轮号指针是尽力而为的导航，不是强一致索引。
   const replyNo = campaign.transcript.length;
   try {
-    if (MEMORY_MODE === 'api') await updateMemoryApi(campaign, lastUserText, replyText, notes, startedAt, replyNo);
+    if (memoryModeNow() === 'api') await updateMemoryApi(campaign, lastUserText, replyText, notes, startedAt, replyNo);
     else await updateMemorySdk(campaign, lastUserText, replyText, notes, startedAt, replyNo);
     saveCampaign(campaign); // 持久化 meta 里的用量累计
   } catch (e) {
@@ -394,35 +512,22 @@ async function updateMemory(campaign, lastUserText, replyText) {
 // 设计：LLM 只负责"出检索词"和"压缩结果"（各一次单轮小调用），检索本身是进程内
 // 毫秒级文本扫描——不用开放式 agent 循环，避免多回合工具往返的延迟。
 // 仅当归档长度超出提示词窗口（RECENT_TURNS）时才启动；窗口内的内容本来就在 prompt 里。
-let RECALL_MODE = (process.env.RECALL_MODE || 'sdk').toLowerCase(); // sdk | api | off
-// 出词模型的思考 token 硬上限（sdk 模式）。自适应思考在"回忆密度高"的轮次会长考到
-// 数千 token、把耗时推过超时线，而出词要的是果断不是深刻。设 0 恢复不设限的自适应。
-const RECALL_THINKING_BUDGET = Number(process.env.RECALL_THINKING_BUDGET ?? 2000);
-const RECALL_MODEL = process.env.RECALL_MODEL || 'claude-haiku-4-5-20251001';
-const RECALL_API_URL = (process.env.RECALL_API_URL || '').replace(/\/+$/, '');
-const RECALL_API_KEY = process.env.RECALL_API_KEY || '';
-const RECALL_API_MODEL = process.env.RECALL_API_MODEL || '';
-const RECALL_BUDGET = Number(process.env.RECALL_BUDGET || 6000);   // 注入内容的字符预算
-const RECALL_TIMEOUT = Number(process.env.RECALL_TIMEOUT || 30000); // 整个回溯的超时，超时放弃不阻塞回复（sdk 模式冷启动实测可达 20-25s）
-if (RECALL_MODE === 'api' && (!RECALL_API_URL || !RECALL_API_MODEL)) {
-  console.warn('[recall] RECALL_MODE=api 但缺少 RECALL_API_URL / RECALL_API_MODEL，回溯已停用');
-  RECALL_MODE = 'off';
-}
+// 各项参数见 CONFIG_SCHEMA 的"回溯"组，可经管理面板热改。
 
 // 两种后端共用的"文本进文本出"单轮补全，返回 { text, usage }
 async function completeText(system, prompt) {
-  if (RECALL_MODE === 'api') {
-    return openaiChat({ url: RECALL_API_URL, key: RECALL_API_KEY, model: RECALL_API_MODEL }, system, prompt);
+  if (CFG.RECALL_MODE === 'api') {
+    return openaiChat({ url: CFG.RECALL_API_URL, key: CFG.RECALL_API_KEY, model: CFG.RECALL_API_MODEL }, system, prompt);
   }
   let text = '';
   let usage = null;
   for await (const msg of query({
     prompt,
     options: {
-      model: RECALL_MODEL, systemPrompt: system, allowedTools: [], settingSources: [], maxTurns: 1,
-      ...(RECALL_EFFORT ? { effort: RECALL_EFFORT } : {}),
-      ...(RECALL_THINKING_BUDGET > 0
-        ? { thinking: { type: 'enabled', budgetTokens: Math.max(1024, RECALL_THINKING_BUDGET) } }
+      model: CFG.RECALL_MODEL, systemPrompt: system, allowedTools: [], settingSources: [], maxTurns: 1,
+      ...(CFG.RECALL_EFFORT ? { effort: CFG.RECALL_EFFORT } : {}),
+      ...(CFG.RECALL_THINKING_BUDGET > 0
+        ? { thinking: { type: 'enabled', budgetTokens: Math.max(1024, CFG.RECALL_THINKING_BUDGET) } }
         : {}),
     },
   })) {
@@ -443,7 +548,7 @@ const withTimeout = (p, ms, tag) => Promise.race([
 // 是关键词逐字匹配不到时的兜底导航。
 function searchArchive(campaign, queries, turnSpecs = []) {
   const t = campaign.transcript;
-  const searchable = Math.max(0, campaign._searchableTo ?? (t.length - RECENT_TURNS));
+  const searchable = Math.max(0, campaign._searchableTo ?? (t.length - CFG.RECENT_TURNS));
   if (!searchable) return [];
   const hit = new Set();
   for (const spec of turnSpecs) {
@@ -471,7 +576,7 @@ function searchArchive(campaign, queries, turnSpecs = []) {
   let used = 0;
   for (const i of [...hit].sort((a, b) => a - b)) {
     const line = `#${i + 1} [${t[i].role}] ${(t[i].content || '').replace(/\s+/g, ' ').slice(0, 600)}`;
-    if (used + line.length > RECALL_BUDGET) break;
+    if (used + line.length > CFG.RECALL_BUDGET) break;
     out.push(line);
     used += line.length;
   }
@@ -485,7 +590,7 @@ async function runRecall(campaign, lastUserText) {
     ? fs.readFileSync(timelinePath, 'utf8').slice(-3000)
     : '（暂无编年史）';
   const qSystem = '你是对话归档检索助手。根据剧情编年史和最新一条消息，判断这一轮是否需要从早期对话原文中查证旧细节（旧承诺、旧台词、具体数字、名字对应关系等）。只输出严格 JSON，不要输出任何其他内容：需要时 {"queries":["关键词1"],"turns":["12","30-35"]}（两个字段各 0-4 个，至少一个字段非空）；不需要时 {"queries":[]}。queries 的检索方式是对原文逐字匹配，因此关键词必须是可能在原文中原样出现的词形：单个人名、地名、物品名、独特称谓或短语。禁止把多个概念拼成话题概括（要"赫克"，不要"赫克评估主角"）；同一名字疑有多种写法时，可让每种写法各占一个关键词。turns 是编年史事件末尾标注的轮号（#N）或轮号范围，当相关事件在编年史里标了轮号、尤其是难以给出逐字关键词时，用它直接按号调取原文。注意 <searchable_range> 给出的归档边界：边界之后的轮次已在当前对话正文中、无需也无法检索，若所需信息全部在边界之后，直接输出 {"queries":[]}。';
-  const searchableTo = Math.max(0, campaign._searchableTo ?? (campaign.transcript.length - RECENT_TURNS));
+  const searchableTo = Math.max(0, campaign._searchableTo ?? (campaign.transcript.length - CFG.RECENT_TURNS));
   const gen = await completeText(qSystem,
     `<searchable_range>\n归档可检索范围：#1 至 #${searchableTo}（#${searchableTo + 1} 起的轮次已在当前对话正文中）\n</searchable_range>\n\n<timeline>\n${timeline}\n</timeline>\n\n<latest_message>\n${lastUserText.slice(0, 2000)}\n</latest_message>`);
   let tag = trackUsage('recall', campaign, gen.usage);
@@ -527,14 +632,12 @@ async function runRecall(campaign, lastUserText) {
 //   pool：请求前预掷一批真随机数注入 system，指示模型按序消耗（零延迟，但约束靠模型自觉）
 // 触发控制（兼容非跑团场景）：auto 模式下扫描 system prompt（预设+卡+世界书）中的
 // 规则关键词，没有检定/骰点语境的卡完全不启用，prompt 零污染。
-const DICE_MODE = (process.env.DICE_MODE || 'tool').toLowerCase();      // tool | pool | off
-const DICE_TRIGGER = (process.env.DICE_TRIGGER || 'auto').toLowerCase(); // auto | always
-const DICE_MAX_TURNS = Number(process.env.DICE_MAX_TURNS || 6); // tool 模式下回复 agent 的回合上限
+// 模式与触发方式见 CONFIG_SCHEMA 的"掷骰"组，可经管理面板热改。
 const DICE_KEYWORDS = /\b\d{0,2}d(?:4|6|8|10|12|20|100)\b|检定|掷骰|骰点|骰子|先攻|豁免|DC\s*\d|跑团|TRPG|龙与地下城|克苏鲁的呼唤|理智检定|San值|命中骰|伤害骰/i;
 
 function diceArmed(systemPrompt) {
-  if (DICE_MODE === 'off') return false;
-  if (DICE_TRIGGER === 'always') return true;
+  if (CFG.DICE_MODE === 'off') return false;
+  if (CFG.DICE_TRIGGER === 'always') return true;
   return DICE_KEYWORDS.test(systemPrompt);
 }
 
@@ -626,11 +729,11 @@ function buildPrompt(body) {
 
   // 历史截断：早期对话交给记忆档案。默认滑动窗口（永远最近 N 轮）；
   // 启用锚定后窗口起点固定、只在超出上限时收缩，其余轮次正文为纯追加。
-  let start = Math.max(0, turns.length - RECENT_TURNS);
-  if (campaign && RECENT_TURNS_MAX > RECENT_TURNS) {
+  let start = Math.max(0, turns.length - CFG.RECENT_TURNS);
+  if (campaign && CFG.RECENT_TURNS_MAX > CFG.RECENT_TURNS) {
     let anchor = campaign.meta.windowAnchor;
     if (!Number.isInteger(anchor) || anchor < 0 || anchor > start) anchor = start;
-    if (turns.length - anchor > RECENT_TURNS_MAX) anchor = start; // 超上限，一次性收缩
+    if (turns.length - anchor > CFG.RECENT_TURNS_MAX) anchor = start; // 超上限，一次性收缩
     campaign.meta.windowAnchor = anchor;
     start = anchor;
   }
@@ -664,10 +767,10 @@ async function* generate(model, systemPrompt, prompt, cwd, usageOut = {}, withDi
       settingSources: [],
       includePartialMessages: true,
       cwd,
-      ...(CHAT_EFFORT ? { effort: CHAT_EFFORT } : {}),
+      ...(CFG.CHAT_EFFORT ? { effort: CFG.CHAT_EFFORT } : {}),
       // 掷骰工具启用时放开工具循环，其余场合保持纯单轮生成
       ...(withDice
-        ? { mcpServers: { dice: diceServer }, allowedTools: ['mcp__dice__roll'], maxTurns: DICE_MAX_TURNS }
+        ? { mcpServers: { dice: diceServer }, allowedTools: ['mcp__dice__roll'], maxTurns: CFG.DICE_MAX_TURNS }
         : { allowedTools: [], maxTurns: 1 }),
     },
   });
@@ -705,17 +808,17 @@ async function handleChat(req, res, body) {
   const { campaign, systemPrompt: baseSystem, prompt, lastUserText } = buildPrompt(body);
   let systemPrompt = baseSystem;
   let promptTail = ''; // 回溯/骰池等每轮易变的注入统一后置，保住前缀缓存
-  if (RECALL_MODE !== 'off' && campaign && lastUserText
-      && (campaign._searchableTo ?? (campaign.transcript.length - RECENT_TURNS)) > 0) {
+  if (recallModeNow() !== 'off' && campaign && lastUserText
+      && (campaign._searchableTo ?? (campaign.transcript.length - CFG.RECENT_TURNS)) > 0) {
     try {
-      promptTail += await withTimeout(runRecall(campaign, lastUserText), RECALL_TIMEOUT, 'recall');
+      promptTail += await withTimeout(runRecall(campaign, lastUserText), CFG.RECALL_TIMEOUT, 'recall');
     } catch (e) {
       console.error('[recall] 失败，跳过:', e.message);
     }
   }
   const id = 'chatcmpl-' + Math.random().toString(36).slice(2);
   const stream = body.stream !== false;
-  const model = MODELS.includes(body.model) ? body.model : DEFAULT_MODEL;
+  const model = MODELS.includes(body.model) ? body.model : CFG.BRIDGE_MODEL;
   const cwd = campaign ? campaign.dir : MEMORY_ROOT;
   const usageOut = {};
   let full = '';
@@ -724,10 +827,10 @@ async function handleChat(req, res, body) {
   let withDice = false;
   const diceCallsBefore = diceRollCount;
   const armed = diceArmed(baseSystem);
-  if (armed && DICE_MODE === 'tool') {
+  if (armed && CFG.DICE_MODE === 'tool') {
     systemPrompt += DICE_TOOL_HINT;
     withDice = true;
-  } else if (armed && DICE_MODE === 'pool') {
+  } else if (armed && CFG.DICE_MODE === 'pool') {
     const { pool, block } = buildDicePool();
     promptTail += block;
     console.log(`[dice] 熵池注入:\n${pool.split('\n').map(l => '        ' + l).join('\n')}`);
@@ -735,10 +838,10 @@ async function handleChat(req, res, body) {
   if (campaign && campaign._diceState !== armed) {
     const wasArmed = campaign._diceState;
     campaign._diceState = armed;
-    if (armed) console.log(`[dice] ${campaign.id} 检测到规则关键词，掷骰已启用 (${DICE_MODE})`);
+    if (armed) console.log(`[dice] ${campaign.id} 检测到规则关键词，掷骰已启用 (${CFG.DICE_MODE})`);
     else if (wasArmed) console.log(`[dice] ${campaign.id} 规则关键词消失，掷骰已停用`);
   }
-  const finalPrompt = prompt + promptTail + '\n\n' + CONTINUE_PROMPT;
+  const finalPrompt = prompt + promptTail + '\n\n' + CFG.CONTINUE_PROMPT;
   try {
     if (stream) {
       res.writeHead(200, {
@@ -787,22 +890,26 @@ async function handleChat(req, res, body) {
   }
 }
 
+function statsSnapshot() {
+  const all = newBucket();
+  for (const b of Object.values(usageTotals)) {
+    all.calls += b.calls; all.input += b.input; all.output += b.output;
+    all.cacheRead += b.cacheRead; all.cacheWrite += b.cacheWrite;
+  }
+  return {
+    uptimeSec: Math.floor((Date.now() - START_TS) / 1000),
+    totals: { ...usageTotals, all },
+    campaigns: [...campaigns.values()]
+      .filter(c => c.meta.tokens)
+      .map(c => ({ id: c.id, title: c.meta.title || '', tokens: c.meta.tokens })),
+  };
+}
+
 const server = http.createServer((req, res) => {
   const url = req.url.split('?')[0];
   if (req.method === 'GET' && (url === '/stats' || url === '/v1/stats')) {
-    const all = newBucket();
-    for (const b of Object.values(usageTotals)) {
-      all.calls += b.calls; all.input += b.input; all.output += b.output;
-      all.cacheRead += b.cacheRead; all.cacheWrite += b.cacheWrite;
-    }
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({
-      uptimeSec: Math.floor((Date.now() - START_TS) / 1000),
-      totals: { ...usageTotals, all },
-      campaigns: [...campaigns.values()]
-        .filter(c => c.meta.tokens)
-        .map(c => ({ id: c.id, title: c.meta.title || '', tokens: c.meta.tokens })),
-    }, null, 2));
+    res.end(JSON.stringify(statsSnapshot(), null, 2));
     return;
   }
   if (req.method === 'GET' && (url === '/v1/models' || url === '/models')) {
@@ -826,11 +933,46 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: { message: 'not found' } }));
 });
 
+// ---------- 管理通道（ST 扩展面板经 ws://.../admin 连入） ----------
+// 面板能力：实时改 CONFIG_SCHEMA 内的配置（免环境变量免重启）、日志流、用量统计。
+// 只绑本机；浏览器客户端还需 Origin 是本机页面（即 ST 前端），防止外部网页乱连。
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, socket, head) => {
+  const origin = req.headers.origin;
+  if (req.url.split('?')[0] !== '/admin'
+      || (origin && !/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(origin))) {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    adminClients.add(ws);
+    ws.on('close', () => adminClients.delete(ws));
+    ws.on('error', () => adminClients.delete(ws));
+    ws.on('message', (data) => {
+      let m;
+      try { m = JSON.parse(String(data)); } catch { return; }
+      if (m.type === 'set') {
+        const r = setConfig(m.key, m.value);
+        ws.send(JSON.stringify({ type: 'setResult', key: m.key, ok: !r.err, error: r.err }));
+      } else if (m.type === 'stats') {
+        ws.send(JSON.stringify({ type: 'stats', stats: statsSnapshot() }));
+      }
+    });
+    ws.send(JSON.stringify({
+      type: 'hello',
+      schema: CONFIG_SCHEMA,
+      config: publicConfig(),
+      info: { port: PORT, memoryRoot: MEMORY_ROOT, pid: process.pid, campaigns: campaigns.size, uptimeSec: Math.floor((Date.now() - START_TS) / 1000) },
+      logs: logRing,
+    }));
+  });
+});
+
 loadCampaigns();
 server.listen(PORT, '127.0.0.1', () => {
-  const recallDesc = RECALL_MODE === 'off' ? 'off'
-    : RECALL_MODE === 'api' ? `api(${RECALL_API_MODEL})` : `sdk(${RECALL_MODEL})`;
-  const memoryDesc = MEMORY_MODE === 'api' ? `api(${MEMORY_API_MODEL})` : `sdk(${MEMORY_MODEL})`;
-  const diceDesc = DICE_MODE === 'off' ? 'off' : `${DICE_MODE}/${DICE_TRIGGER}`;
-  console.log(`st-claude-bridge listening on http://127.0.0.1:${PORT}/v1  (default: ${DEFAULT_MODEL}, memory: ${memoryDesc}, recall: ${recallDesc}, dice: ${diceDesc}, campaigns: ${campaigns.size}, root: ${MEMORY_ROOT})`);
+  const recallDesc = CFG.RECALL_MODE === 'off' ? 'off'
+    : CFG.RECALL_MODE === 'api' ? `api(${CFG.RECALL_API_MODEL})` : `sdk(${CFG.RECALL_MODEL})`;
+  const memoryDesc = CFG.MEMORY_MODE === 'api' ? `api(${CFG.MEMORY_API_MODEL})` : `sdk(${CFG.MEMORY_MODEL || CFG.BRIDGE_MODEL})`;
+  const diceDesc = CFG.DICE_MODE === 'off' ? 'off' : `${CFG.DICE_MODE}/${CFG.DICE_TRIGGER}`;
+  console.log(`st-claude-bridge listening on http://127.0.0.1:${PORT}/v1  (default: ${CFG.BRIDGE_MODEL}, memory: ${memoryDesc}, recall: ${recallDesc}, dice: ${diceDesc}, campaigns: ${campaigns.size}, root: ${MEMORY_ROOT}, admin: ws://127.0.0.1:${PORT}/admin)`);
 });
