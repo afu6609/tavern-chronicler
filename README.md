@@ -54,18 +54,18 @@ Windows 下也可以直接双击仓库里的 `start.bat`（SillyTavern 用它自
 
 ## 管理面板（SillyTavern 扩展）
 
-仓库自带一个 ST UI 扩展（`st-extension/`），在酒馆的扩展设置抽屉里提供 **Tavern Chronicler** 面板：
+配套的 ST UI 扩展放在本仓库的 [`st-extension` 分支](https://github.com/afu6609/tavern-chronicler/tree/st-extension)（独立分支、根目录即 manifest，桥代码与插件代码互不混杂），在酒馆的扩展设置抽屉里提供 **Tavern Chronicler** 面板：
 
 - **配置热改**：下表除 `PORT` / `MEMORY_ROOT` 外的所有配置项按组渲染成表单，改完即时生效（下一轮请求即用新值）、无需重启桥；修改持久化到 `memory/bridge-config.json`
 - **日志实时流**：桥的控制台日志按 `[chat]` / `[recall]` / `[memory]` / `[dice]` 着色流入面板（连接时先回放最近 400 行），掷骰虚构告警等 ⚠ 行高亮——不用再盯桥的控制台窗口
 - **用量快照**：一键查看本次运行的分路径 token 汇总
 
-安装：把 `st-extension/` 复制（或做目录联接）到 `SillyTavern/public/scripts/extensions/third-party/tavern-chronicler`，刷新酒馆页面即可；面板默认连 `ws://127.0.0.1:9377/admin`，桥端口有改的话在面板顶部改地址。管理通道只监听本机且校验来源页面，外部网页无法连入；API 密钥类字段在面板侧始终打码。
+安装（任选其一，装完刷新酒馆页面即可）：
 
-```bat
-:: Windows 下用目录联接（改仓库里的扩展文件即时生效，无需复制同步）
-mklink /J "SillyTavern\public\scripts\extensions\third-party\tavern-chronicler" "st-claude-bridge\st-extension"
-```
+- **ST 扩展安装器**：扩展 → 安装扩展，仓库地址填本仓库、分支填 `st-extension`
+- **手动克隆**：`git clone -b st-extension https://github.com/afu6609/tavern-chronicler SillyTavern/public/scripts/extensions/third-party/tavern-chronicler`
+
+面板默认连 `ws://127.0.0.1:9377/admin`，桥端口有改的话在面板顶部改地址。管理通道只监听本机且校验来源页面，外部网页无法连入；API 密钥类字段在面板侧始终打码。
 
 ## 配置
 
