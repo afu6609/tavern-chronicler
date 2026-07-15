@@ -73,7 +73,7 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const CONFIG_SCHEMA = {
   BRIDGE_MODEL: { group: '模型', label: '默认回复模型', type: 'enum', values: MODELS, def: 'claude-sonnet-5',
     desc: 'ST 未指定或指定了未知模型时使用' },
-  CHAT_EFFORT: { group: '模型', label: '回复推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: '',
+  CHAT_EFFORT: { group: '模型', label: '回复推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: '', emptyLabel: '（SDK 默认 high）',
     desc: '空 = 跟随 SDK 默认（high）。低档出字快、消耗低，高档叙事更深' },
   CONTINUE_PROMPT: { group: '模型', label: '续写指令', type: 'str', multiline: true,
     def: '衔接 transcript 最后一条消息，遵循 system 中的全部设定（包括视角、人称、文风与角色分配），自然地续写下一条回复。只输出回复正文，不要输出任何解释或前缀。',
@@ -86,8 +86,9 @@ const CONFIG_SCHEMA = {
 
   RECALL_MODE: { group: '回溯', label: '回溯模式', type: 'enum', values: ['sdk', 'api', 'off'], lower: true, def: 'sdk' },
   RECALL_MODEL: { group: '回溯', label: '出词模型', type: 'str', def: 'claude-haiku-4-5-20251001',
-    desc: 'sdk 模式下出词与压缩用的模型' },
-  RECALL_EFFORT: { group: '回溯', label: '出词推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: 'low',
+    options: ['claude-haiku-4-5-20251001', ...MODELS],
+    desc: '仅 sdk 模式生效。出词是机械任务，默认用便宜快速的 Haiku 即可' },
+  RECALL_EFFORT: { group: '回溯', label: '出词推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: 'low', emptyLabel: '（SDK 默认 high）',
     desc: '出词是机械任务，低档即可' },
   RECALL_THINKING_BUDGET: { group: '回溯', label: '出词思考上限', type: 'int', min: 0, def: 2000,
     desc: '思考 token 硬上限，防止回忆密集轮长考超时；0=不设限的自适应' },
@@ -100,8 +101,9 @@ const CONFIG_SCHEMA = {
 
   MEMORY_MODE: { group: '记忆', label: '记忆模式', type: 'enum', values: ['sdk', 'api'], lower: true, def: 'sdk',
     desc: 'sdk=agent 带文件工具增量编辑；api=自配端点全文件重写' },
-  MEMORY_MODEL: { group: '记忆', label: '记忆模型', type: 'str', def: '', desc: '空 = 跟随默认回复模型（sdk 模式）' },
-  MEMORY_EFFORT: { group: '记忆', label: '记忆推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: '',
+  MEMORY_MODEL: { group: '记忆', label: '记忆模型', type: 'str', def: '', options: ['', ...MODELS], emptyLabel: '（跟随默认回复模型）',
+    desc: '仅 sdk 模式生效。空 = 跟随默认回复模型，记账质量与主模型对齐；可指定便宜档位省额度' },
+  MEMORY_EFFORT: { group: '记忆', label: '记忆推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: '', emptyLabel: '（SDK 默认 high）',
     desc: '空 = 跟随 SDK 默认（high）；medium 可显著缩短更新耗时' },
   MEMORY_MAX_TURNS: { group: '记忆', label: '工具回合上限', type: 'int', min: 4, def: 30,
     desc: '记忆 agent 的最大工具回合数，长回复+5文件读写实测可超 15' },
@@ -134,18 +136,23 @@ function normalizeConfig(key, raw) {
   return { value: v };
 }
 
+// 面板层之下的基线值：环境变量 > 内置默认（恢复默认设置时回落到这里）
+function baselineConfig(key) {
+  const envRaw = process.env[key];
+  if (envRaw !== undefined && envRaw !== '') {
+    const r = normalizeConfig(key, envRaw);
+    if (r.err) console.warn(`[config] 环境变量 ${key}=${envRaw} 无效（${r.err}），已忽略`);
+    else return r.value;
+  }
+  return CONFIG_SCHEMA[key].def;
+}
+
 const CFG = {};
 let fileConfig = {};
 try { fileConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { fileConfig = {}; }
 if (typeof fileConfig !== 'object' || fileConfig === null || Array.isArray(fileConfig)) fileConfig = {};
 for (const key of Object.keys(CONFIG_SCHEMA)) {
-  let v = CONFIG_SCHEMA[key].def;
-  const envRaw = process.env[key];
-  if (envRaw !== undefined && envRaw !== '') {
-    const r = normalizeConfig(key, envRaw);
-    if (r.err) console.warn(`[config] 环境变量 ${key}=${envRaw} 无效（${r.err}），已忽略`);
-    else v = r.value;
-  }
+  let v = baselineConfig(key);
   if (Object.hasOwn(fileConfig, key)) {
     const r = normalizeConfig(key, fileConfig[key]);
     if (r.err) console.warn(`[config] bridge-config.json 的 ${key} 无效（${r.err}），已忽略`);
@@ -165,6 +172,16 @@ function setConfig(key, raw) {
   console.log(`[config] ${key} = ${CONFIG_SCHEMA[key].secret ? '（已隐藏）' : JSON.stringify(r.value)}（面板修改，即时生效）`);
   broadcastAdmin({ type: 'config', config: publicConfig() });
   return { value: r.value };
+}
+
+// 恢复默认设置：清空面板覆盖层（含密钥），全部回落到 环境变量 > 内置默认
+function resetConfig() {
+  fileConfig = {};
+  try { fs.writeFileSync(CONFIG_FILE, '{}\n'); }
+  catch (e) { console.warn(`[config] bridge-config.json 写入失败: ${e.message}`); }
+  for (const key of Object.keys(CONFIG_SCHEMA)) CFG[key] = baselineConfig(key);
+  console.log('[config] 已恢复默认设置（面板层清空，回落到环境变量/内置默认，即时生效）');
+  broadcastAdmin({ type: 'config', config: publicConfig() });
 }
 
 // 发给面板的配置快照（密钥打码，真实值只进不出）
@@ -954,6 +971,8 @@ server.on('upgrade', (req, socket, head) => {
       if (m.type === 'set') {
         const r = setConfig(m.key, m.value);
         ws.send(JSON.stringify({ type: 'setResult', key: m.key, ok: !r.err, error: r.err }));
+      } else if (m.type === 'reset') {
+        resetConfig();
       } else if (m.type === 'stats') {
         ws.send(JSON.stringify({ type: 'stats', stats: statsSnapshot() }));
       }
