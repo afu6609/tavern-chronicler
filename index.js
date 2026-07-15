@@ -36,6 +36,9 @@
                 </div>
                 <div id="tcb-info" class="tcb-info">尚未连接到桥。桥需运行 2026-07-15 之后的版本（含 /admin 管理通道）。</div>
                 <div id="tcb-groups"></div>
+                <div id="tcb-reset-row" class="tcb-reset-row" style="display:none">
+                    <input id="tcb-reset" class="menu_button tcb-mini" type="button" value="恢复默认设置">
+                </div>
                 <div class="tcb-log-head">
                     <b>桥日志</b>
                     <label class="checkbox_label"><input id="tcb-autoscroll" type="checkbox" checked><span>自动滚动</span></label>
@@ -87,6 +90,7 @@
             const i = m.info || {};
             $id('tcb-info').textContent =
                 `桥 PID ${i.pid} · 端口 ${i.port}（重启生效项）· 战役 ${i.campaigns} 个 · 档案根: ${i.memoryRoot}`;
+            $id('tcb-reset-row').style.display = '';
             $id('tcb-log').replaceChildren();
             for (const entry of m.logs || []) appendLog(entry);
             appendLocal('—— 已连接，以上为回放日志 ——', 'tcb-sep');
@@ -129,10 +133,15 @@
         const label = el('label', null, s.label);
         label.title = key + (s.desc ? '\n' + s.desc : '');
         let input;
-        if (s.type === 'enum') {
+        // enum 的 values 是硬性可选集；str 的 options 是建议集（服务端仍接受任意字符串），
+        // 两者面板上都渲染成下拉框。当前值不在集合内时补一个选项，避免显示空白。
+        const choices = s.type === 'enum' ? s.values : s.options;
+        if (choices) {
             input = el('select', 'text_pole');
-            for (const v of s.values) {
-                const opt = el('option', null, v === '' ? '（默认）' : v);
+            const cur = value ?? '';
+            const list = choices.includes(cur) ? choices : [...choices, cur];
+            for (const v of list) {
+                const opt = el('option', null, v === '' ? (s.emptyLabel || '（默认）') : v);
                 opt.value = v;
                 input.append(opt);
             }
@@ -164,7 +173,14 @@
         if (!schema) return;
         for (const key of Object.keys(schema)) {
             const input = $id('tcb-f-' + key);
-            if (input && document.activeElement !== input) input.value = config[key] ?? '';
+            if (!input || document.activeElement === input) continue;
+            const val = config[key] ?? '';
+            if (input.tagName === 'SELECT' && ![...input.options].some(o => o.value === val)) {
+                const opt = el('option', null, val === '' ? (schema[key].emptyLabel || '（默认）') : val);
+                opt.value = val;
+                input.append(opt);
+            }
+            input.value = val;
         }
     }
 
@@ -208,6 +224,10 @@
         $id('tcb-connect').addEventListener('click', connect);
         $id('tcb-clear').addEventListener('click', () => $id('tcb-log').replaceChildren());
         $id('tcb-stats').addEventListener('click', () => send({ type: 'stats' }));
+        $id('tcb-reset').addEventListener('click', () => {
+            if (!confirm('将清空面板改过的全部配置（含 API 密钥），回落到桥启动时的环境变量或内置默认，并即时生效。确定恢复默认设置？')) return;
+            send({ type: 'reset' });
+        });
         connect();
     });
 })();
