@@ -18,14 +18,21 @@ const PORT = Number(process.env.PORT || 9377);
 const MODELS = [
   'claude-fable-5',
   'claude-opus-4-8',
+  // [1m] 后缀 = Claude Code 的 1M 上下文变体。可用性随套餐/模型而异：
+  // 选了不可用的变体会在生成时报错，换回普通版即可。长上下文按更高权重计费。
+  'claude-opus-4-8[1m]',
   'claude-opus-4-7',
+  'claude-opus-4-7[1m]',
   'claude-opus-4-6',
+  'claude-opus-4-6[1m]',
   'claude-opus-4-5',
   'claude-opus-4-1',
   'claude-opus-4-0',
   'claude-sonnet-5',
   'claude-sonnet-4-6',
+  'claude-sonnet-4-6[1m]',
   'claude-sonnet-4-5',
+  'claude-sonnet-4-5[1m]',
   'claude-sonnet-4-0',
 ];
 const DEFAULT_MODEL = process.env.BRIDGE_MODEL || 'claude-sonnet-5';
