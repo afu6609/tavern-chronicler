@@ -704,8 +704,10 @@ async function handleChat(req, res, body) {
     console.log(`[dice] 熵池注入:\n${pool.split('\n').map(l => '        ' + l).join('\n')}`);
   }
   if (campaign && campaign._diceState !== armed) {
+    const wasArmed = campaign._diceState;
     campaign._diceState = armed;
     if (armed) console.log(`[dice] ${campaign.id} 检测到规则关键词，掷骰已启用 (${DICE_MODE})`);
+    else if (wasArmed) console.log(`[dice] ${campaign.id} 规则关键词消失，掷骰已停用`);
   }
   try {
     if (stream) {
