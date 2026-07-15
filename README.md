@@ -78,23 +78,23 @@ Windows 下也可以直接双击仓库里的 `start.bat`（SillyTavern 用它自
 | `CHAT_EFFORT` | SDK 默认（`high`） | 回复模型的推理力度：`low` / `medium` / `high` / `xhigh`。调低可显著减少思考 token、加快出字，代价是叙事规划变浅 |
 | `RECALL_EFFORT` | `low` | 回溯出词模型的推理力度。提关键词是机械任务，默认 low 省时省 token |
 | `RECALL_THINKING_BUDGET` | `2000` | 出词模型思考 token 上限（sdk 模式）。自适应思考在回忆密集的轮次会长考数千 token 拖过超时线；出词要果断不要深刻。设 `0` 恢复不设限 |
-| `MEMORY_EFFORT` | SDK 默认 | 记忆 agent 的推理力度（sdk 模式） |
+| `MEMORY_EFFORT` | `medium` | 记忆 agent 的推理力度（sdk 模式）。medium 比 high 显著缩短更新耗时，档案质量实测无损；设空字符串可回到 SDK 默认（high） |
 | `MEMORY_MODEL` | 同 `BRIDGE_MODEL` | 记忆更新用的模型（sdk 模式），可设便宜档位省额度 |
 | `MEMORY_MODE` | `sdk` | 记忆后端：`sdk`（Agent SDK 带文件工具增量编辑）/ `api`（自配 OpenAI 兼容端点，走全文件重写协议） |
 | `MEMORY_API_URL` | — | api 模式端点（如 `https://xxx/v1`），配合 `MEMORY_API_KEY`、`MEMORY_API_MODEL` |
 | `MEMORY_MAX_TURNS` | `30` | 记忆 agent（sdk 模式）的最大工具回合数，长回复大档案可适当调高 |
 | `MEMORY_ROOT` | `./memory` | 战役档案根目录（重启生效） |
-| `RECENT_TURNS` | `40` | 正文携带的最近对话轮数；更早的历史由战役档案接管 |
+| `RECENT_TURNS` | `25` | 正文携带的最近对话轮数；更早的历史由战役档案接管 |
 | `RECENT_TURNS_MAX` | `0`（关闭） | 窗口锚定模式：设为大于 `RECENT_TURNS` 的值后，窗口起点固定、正文纯追加（前缀缓存跨轮存活），涨到该上限才一次性收缩回 `RECENT_TURNS`。仅在两轮间隔小于缓存寿命（5 分钟）的快节奏对话中有收益，慢节奏对话请保持关闭 |
 | `CONTINUE_PROMPT` | 中性续写指令 | 拼在 prompt 末尾的续写指令。默认不指定任何身份/视角（多角色、多人称、旁白式预设均不受干预），仅要求衔接上文自然续写；需要强制某种视角时可自行覆盖 |
 | `RECALL_MODE` | `sdk` | 定向回溯后端：`sdk`（走 Claude Code 订阅）/ `api`（自配 OpenAI 兼容端点）/ `off` |
 | `RECALL_MODEL` | `claude-haiku-4-5-20251001` | sdk 模式用的模型 |
 | `RECALL_API_URL` | — | api 模式的端点（如 `https://xxx/v1`），配合 `RECALL_API_KEY`、`RECALL_API_MODEL` |
 | `RECALL_BUDGET` | `6000` | 回溯注入内容的字符预算 |
-| `RECALL_TIMEOUT` | `30000` | 回溯整体超时（ms），超时直接放弃、不阻塞回复 |
+| `RECALL_TIMEOUT` | `120000` | 回溯整体超时（ms），超时直接放弃、不阻塞回复。命中多时要出词+压缩两次调用，调小会掐掉恰恰最有价值的回溯 |
 | `DICE_MODE` | `tool` | 掷骰机制：`tool`（进程内 MCP 工具，真随机决定成败）/ `pool`（熵池注入，零延迟）/ `off` |
 | `DICE_TRIGGER` | `auto` | `auto` = 扫描预设/卡中的规则关键词，非跑团场景不触发；`always` = 总是启用 |
-| `DICE_MAX_TURNS` | `6` | tool 模式下回复 agent 的工具回合上限 |
+| `DICE_MAX_TURNS` | `12` | tool 模式下回复 agent 的工具回合上限，足够覆盖多次检定的战斗轮 |
 
 ### 可选模型
 

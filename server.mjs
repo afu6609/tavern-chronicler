@@ -79,7 +79,7 @@ const CONFIG_SCHEMA = {
     def: '衔接 transcript 最后一条消息，遵循 system 中的全部设定（包括视角、人称、文风与角色分配），自然地续写下一条回复。只输出回复正文，不要输出任何解释或前缀。',
     desc: '拼在每次请求末尾的中性续写指令，视角/人称交给预设决定' },
 
-  RECENT_TURNS: { group: '窗口', label: '窗口轮数', type: 'int', min: 1, def: 40,
+  RECENT_TURNS: { group: '窗口', label: '窗口轮数', type: 'int', min: 1, def: 25,
     desc: '正文保留的最近对话轮数，更早的靠记忆档案与回溯' },
   RECENT_TURNS_MAX: { group: '窗口', label: '锚定窗口上限', type: 'int', min: 0, def: 0,
     desc: '0=关闭。设为大于窗口轮数启用锚定：窗口起点固定、正文纯追加省缓存，涨到上限一次性收缩。只在两轮间隔小于缓存寿命（5 分钟）的快节奏对话中有收益' },
@@ -93,8 +93,8 @@ const CONFIG_SCHEMA = {
   RECALL_THINKING_BUDGET: { group: '回溯', label: '出词思考上限', type: 'int', min: 0, def: 2000,
     desc: '思考 token 硬上限，防止回忆密集轮长考超时；0=不设限的自适应' },
   RECALL_BUDGET: { group: '回溯', label: '注入字符预算', type: 'int', min: 500, def: 6000 },
-  RECALL_TIMEOUT: { group: '回溯', label: '超时 (ms)', type: 'int', min: 1000, def: 30000,
-    desc: '整个回溯的超时，超时放弃不阻塞回复；命中多时要两次调用，建议 ≥ 90000' },
+  RECALL_TIMEOUT: { group: '回溯', label: '超时 (ms)', type: 'int', min: 1000, def: 120000,
+    desc: '整个回溯的超时，超时放弃不阻塞回复。命中多时要出词+压缩两次调用（各约 20-60s），调小会掐掉恰恰最有价值的回溯' },
   RECALL_API_URL: { group: '回溯', label: 'API 地址', type: 'str', def: '', desc: 'api 模式的 OpenAI 兼容端点' },
   RECALL_API_KEY: { group: '回溯', label: 'API 密钥', type: 'str', secret: true, def: '' },
   RECALL_API_MODEL: { group: '回溯', label: 'API 模型', type: 'str', def: '' },
@@ -103,8 +103,8 @@ const CONFIG_SCHEMA = {
     desc: 'sdk=agent 带文件工具增量编辑；api=自配端点全文件重写' },
   MEMORY_MODEL: { group: '记忆', label: '记忆模型', type: 'str', def: '', options: ['', ...MODELS], emptyLabel: '（跟随默认回复模型）',
     desc: '仅 sdk 模式生效。空 = 跟随默认回复模型，记账质量与主模型对齐；可指定便宜档位省额度' },
-  MEMORY_EFFORT: { group: '记忆', label: '记忆推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: '', emptyLabel: '（SDK 默认 high）',
-    desc: '空 = 跟随 SDK 默认（high）；medium 可显著缩短更新耗时' },
+  MEMORY_EFFORT: { group: '记忆', label: '记忆推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: 'medium', emptyLabel: '（SDK 默认 high）',
+    desc: '默认 medium：比 high 显著缩短更新耗时，档案质量实测无损' },
   MEMORY_MAX_TURNS: { group: '记忆', label: '工具回合上限', type: 'int', min: 4, def: 30,
     desc: '记忆 agent 的最大工具回合数，长回复+5文件读写实测可超 15' },
   MEMORY_API_URL: { group: '记忆', label: 'API 地址', type: 'str', def: '' },
@@ -115,8 +115,8 @@ const CONFIG_SCHEMA = {
     desc: 'tool=真随机掷骰工具（推荐）；pool=预掷熵池注入' },
   DICE_TRIGGER: { group: '掷骰', label: '触发方式', type: 'enum', values: ['auto', 'always'], lower: true, def: 'auto',
     desc: 'auto=检测到规则关键词才启用，非跑团场景零介入' },
-  DICE_MAX_TURNS: { group: '掷骰', label: '工具回合上限', type: 'int', min: 2, def: 6,
-    desc: 'tool 模式下回复 agent 的回合上限，多次检定的战斗轮建议 ≥ 10' },
+  DICE_MAX_TURNS: { group: '掷骰', label: '工具回合上限', type: 'int', min: 2, def: 12,
+    desc: 'tool 模式下回复 agent 的回合上限；默认 12 足够覆盖多次检定的战斗轮' },
 };
 
 function normalizeConfig(key, raw) {
