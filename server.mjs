@@ -620,12 +620,13 @@ function buildPrompt(body) {
     .map(t => (t.role === 'assistant' ? `[assistant]\n${t.content}` : `[user]\n${t.content}`))
     .join('\n\n');
 
-  const systemPrompt = systemParts.join('\n\n') + (campaign ? readMemory(campaign) : '');
+  // 缓存友好排布：md 档案等每轮易变的内容后置到正文之后，让 system（预设）
+  // 与 transcript 的长前缀保持逐字稳定——md 变化只作废末尾一小段缓存。
+  const systemPrompt = systemParts.join('\n\n');
   const prompt = [
-    dropped > 0 ? `（更早的 ${dropped} 条对话已归档进战役记忆，见 system 中的 campaign_memory）` : '',
+    dropped > 0 ? `（更早的 ${dropped} 条对话已归档进战役记忆，见下方 campaign_memory）` : '',
     '<transcript>', transcriptText, '</transcript>',
-    '',
-    CONTINUE_PROMPT,
+    campaign ? readMemory(campaign) : '',
   ].filter(Boolean).join('\n');
 
   return { campaign, systemPrompt, prompt, lastUserText };
@@ -681,9 +682,10 @@ function toOpenaiUsage(rawUsage) {
 async function handleChat(req, res, body) {
   const { campaign, systemPrompt: baseSystem, prompt, lastUserText } = buildPrompt(body);
   let systemPrompt = baseSystem;
+  let promptTail = ''; // 回溯/骰池等每轮易变的注入统一后置，保住前缀缓存
   if (RECALL_MODE !== 'off' && campaign && campaign.transcript.length > RECENT_TURNS && lastUserText) {
     try {
-      systemPrompt += await withTimeout(runRecall(campaign, lastUserText), RECALL_TIMEOUT, 'recall');
+      promptTail += await withTimeout(runRecall(campaign, lastUserText), RECALL_TIMEOUT, 'recall');
     } catch (e) {
       console.error('[recall] 失败，跳过:', e.message);
     }
@@ -704,7 +706,7 @@ async function handleChat(req, res, body) {
     withDice = true;
   } else if (armed && DICE_MODE === 'pool') {
     const { pool, block } = buildDicePool();
-    systemPrompt += block;
+    promptTail += block;
     console.log(`[dice] 熵池注入:\n${pool.split('\n').map(l => '        ' + l).join('\n')}`);
   }
   if (campaign && campaign._diceState !== armed) {
@@ -713,6 +715,7 @@ async function handleChat(req, res, body) {
     if (armed) console.log(`[dice] ${campaign.id} 检测到规则关键词，掷骰已启用 (${DICE_MODE})`);
     else if (wasArmed) console.log(`[dice] ${campaign.id} 规则关键词消失，掷骰已停用`);
   }
+  const finalPrompt = prompt + promptTail + '\n\n' + CONTINUE_PROMPT;
   try {
     if (stream) {
       res.writeHead(200, {
@@ -721,7 +724,7 @@ async function handleChat(req, res, body) {
         'Connection': 'keep-alive',
       });
       res.write(sseChunk(id, model, { role: 'assistant', content: '' }));
-      for await (const text of generate(model, systemPrompt, prompt, cwd, usageOut, withDice)) {
+      for await (const text of generate(model, systemPrompt, finalPrompt, cwd, usageOut, withDice)) {
         full += text;
         res.write(sseChunk(id, model, { content: text }));
       }
@@ -729,7 +732,7 @@ async function handleChat(req, res, body) {
       res.write('data: [DONE]\n\n');
       res.end();
     } else {
-      for await (const text of generate(model, systemPrompt, prompt, cwd, usageOut, withDice)) full += text;
+      for await (const text of generate(model, systemPrompt, finalPrompt, cwd, usageOut, withDice)) full += text;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         id, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
