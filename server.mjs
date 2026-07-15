@@ -384,6 +384,9 @@ async function updateMemory(campaign, lastUserText, replyText) {
 // 毫秒级文本扫描——不用开放式 agent 循环，避免多回合工具往返的延迟。
 // 仅当归档长度超出提示词窗口（RECENT_TURNS）时才启动；窗口内的内容本来就在 prompt 里。
 let RECALL_MODE = (process.env.RECALL_MODE || 'sdk').toLowerCase(); // sdk | api | off
+// 出词模型的思考 token 硬上限（sdk 模式）。自适应思考在"回忆密度高"的轮次会长考到
+// 数千 token、把耗时推过超时线，而出词要的是果断不是深刻。设 0 恢复不设限的自适应。
+const RECALL_THINKING_BUDGET = Number(process.env.RECALL_THINKING_BUDGET ?? 2000);
 const RECALL_MODEL = process.env.RECALL_MODEL || 'claude-haiku-4-5-20251001';
 const RECALL_API_URL = (process.env.RECALL_API_URL || '').replace(/\/+$/, '');
 const RECALL_API_KEY = process.env.RECALL_API_KEY || '';
@@ -407,6 +410,9 @@ async function completeText(system, prompt) {
     options: {
       model: RECALL_MODEL, systemPrompt: system, allowedTools: [], settingSources: [], maxTurns: 1,
       ...(RECALL_EFFORT ? { effort: RECALL_EFFORT } : {}),
+      ...(RECALL_THINKING_BUDGET > 0
+        ? { thinking: { type: 'enabled', budgetTokens: Math.max(1024, RECALL_THINKING_BUDGET) } }
+        : {}),
     },
   })) {
     if (msg.type === 'result' && msg.subtype === 'success') {

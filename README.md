@@ -57,6 +57,7 @@ node server.mjs
 | `BRIDGE_MODEL` | `claude-sonnet-5` | 默认回复模型（ST 里未选择或选择无效时的回退） |
 | `CHAT_EFFORT` | SDK 默认（`high`） | 回复模型的推理力度：`low` / `medium` / `high` / `xhigh`。调低可显著减少思考 token、加快出字，代价是叙事规划变浅 |
 | `RECALL_EFFORT` | `low` | 回溯出词模型的推理力度。提关键词是机械任务，默认 low 省时省 token |
+| `RECALL_THINKING_BUDGET` | `2000` | 出词模型思考 token 上限（sdk 模式）。自适应思考在回忆密集的轮次会长考数千 token 拖过超时线；出词要果断不要深刻。设 `0` 恢复不设限 |
 | `MEMORY_EFFORT` | SDK 默认 | 记忆 agent 的推理力度（sdk 模式） |
 | `MEMORY_MODEL` | 同 `BRIDGE_MODEL` | 记忆更新用的模型（sdk 模式），可设便宜档位省额度 |
 | `MEMORY_MODE` | `sdk` | 记忆后端：`sdk`（Agent SDK 带文件工具增量编辑）/ `api`（自配 OpenAI 兼容端点，走全文件重写协议） |
