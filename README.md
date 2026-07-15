@@ -24,3 +24,7 @@ git clone -b st-extension https://github.com/afu6609/tavern-chronicler \
 ```
 
 安装后刷新酒馆页面，扩展设置抽屉里即出现 **Tavern Chronicler** 面板。需要桥运行 2026-07-15 之后的版本（含 `/admin` 管理通道）。
+
+## License
+
+[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/deed.zh-hans)：使用、修改、分发须署名原作者（afu6609）并附仓库出处，禁止商业用途。完整条款见 [LICENSE](LICENSE)。
