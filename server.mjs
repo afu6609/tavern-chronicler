@@ -527,6 +527,8 @@ function diceArmed(systemPrompt) {
   return DICE_KEYWORDS.test(systemPrompt);
 }
 
+let diceRollCount = 0; // 本进程累计真实掷骰次数，用于事后核对回复中的骰点是否出自工具
+
 // 解析并投掷 NdM+K（1≤N≤100，2≤M≤1000），crypto 真随机
 function rollFormula(formula) {
   const m = String(formula).trim().match(/^(\d{0,3})[dD](\d{1,4})\s*([+-]\s*\d{1,4})?$/);
@@ -551,6 +553,7 @@ const diceServer = createSdkMcpServer({
       async ({ formula }) => {
         try {
           const r = rollFormula(formula);
+          diceRollCount++;
           console.log(`[dice] ${r.text}`);
           return { content: [{ type: 'text', text: r.text }] };
         } catch (e) {
@@ -561,7 +564,7 @@ const diceServer = createSdkMcpServer({
   ],
 });
 
-const DICE_TOOL_HINT = '\n\n<dice_tool>\n已接入真随机掷骰工具 roll（骰式如 1d20+5）。当剧情需要检定/攻击/伤害等骰点时调用它，并严格以返回结果叙述成败；纯对话与叙事场合不要调用。骰点结果请在正文中如实呈现（如"检定：1d20+3=17，成功"）。\n</dice_tool>';
+const DICE_TOOL_HINT = '\n\n<dice_tool>\n已接入真随机掷骰工具 roll（骰式如 1d20+5、2d20）。硬性规则：回复中出现的一切骰点数字——包括任何战斗/检定模板里的"掷骰"字段、优势/劣势取值、命中骰、伤害骰、随机表——都必须来自 roll 工具的真实返回值。先调用工具拿到点数，再据其撰写结算与叙事；严禁凭空编写任何点数，哪怕格式模板要求填写。一次需要多个点数时，在同一条消息里并行发出多个 roll 调用（优势/劣势 = roll("2d20") 后取高/取低）。纯对话与无检定的叙事场合不要调用。\n</dice_tool>';
 
 function buildDicePool() {
   const seq = (n, faces) => Array.from({ length: n }, () => crypto.randomInt(1, faces + 1)).join(', ');
@@ -694,6 +697,7 @@ async function handleChat(req, res, body) {
 
   // 掷骰：按 system（预设+卡+世界书）中的规则关键词决定是否启用，非跑团场景零介入
   let withDice = false;
+  const diceCallsBefore = diceRollCount;
   const armed = diceArmed(baseSystem);
   if (armed && DICE_MODE === 'tool') {
     systemPrompt += DICE_TOOL_HINT;
@@ -735,6 +739,10 @@ async function handleChat(req, res, body) {
     }
     const tag = trackUsage('chat', campaign, usageOut.usage);
     console.log(`[chat] 回复 ${full.length} 字符 (${model}${campaign ? ', ' + campaign.id : ''})${tag}`);
+    // 骰点对账：挂了工具却零调用、正文里又出现骰点描述 → 点数是模型编的
+    if (withDice && diceRollCount === diceCallsBefore && /掷骰\s*[:：]|\bd\d{1,3}\s*[（(]\s*\d/i.test(full)) {
+      console.warn('[dice] ⚠ 警告：回复包含骰点描述但未调用掷骰工具，点数疑为模型虚构');
+    }
     if (campaign && full) {
       // 立刻归档本条回复，不等 ST 的下一次请求
       campaign.transcript.push({ role: 'assistant', content: full });
