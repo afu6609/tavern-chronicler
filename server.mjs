@@ -432,19 +432,44 @@ function shiftTimeline(campaign, offset) {
   console.log(`[campaign] ${campaign.id} timeline 轮号整体 +${offset}（原文件备份为 timeline.pre-import.bak）`);
 }
 
-function importCampaign(m) {
-  const turns = (Array.isArray(m.turns) ? m.turns : [])
+// 面板发来的消息列表 → 规整轮次；与全部战役做指纹匹配，命中 ≥3 视为同一战役
+function normalizeImportTurns(m) {
+  return (Array.isArray(m.turns) ? m.turns : [])
     .filter(t => t && (t.role === 'user' || t.role === 'assistant')
       && typeof t.content === 'string' && t.content.trim())
     .map(t => ({ role: t.role, content: t.content }));
-  if (turns.length < 3) return { ok: false, error: '有效消息不足 3 条，无法导入' };
-  const hashes = turns.map(turnHash);
+}
 
+function findMatchingCampaign(hashes) {
   let best = null;
   for (const c of campaigns.values()) {
     const n = hashes.reduce((s, h) => s + (c.hashSet.has(h) ? 1 : 0), 0);
     if (n >= 3 && (!best || n > best.n)) best = { c, n };
   }
+  return best;
+}
+
+// 战役概要（面板管理卡片用）
+function campaignBrief(c) {
+  const files = MEMORY_MD_FILES.filter(f => fs.existsSync(path.join(c.dir, f)))
+    .map(f => ({ name: f, size: fs.statSync(path.join(c.dir, f)).size }));
+  return {
+    campaignId: c.id,
+    title: c.meta.title || '',
+    turns: c.transcript.length,
+    lastSeen: c.meta.lastSeen || null,
+    catchupTo: c.meta.catchupTo ?? null,
+    catchupTarget: c.meta.catchupTarget ?? null,
+    busy: !!(c.memoryJobRunning || c._catchupRunning),
+    files,
+  };
+}
+
+function importCampaign(m) {
+  const turns = normalizeImportTurns(m);
+  if (turns.length < 3) return { ok: false, error: '有效消息不足 3 条，无法导入' };
+  const hashes = turns.map(turnHash);
+  const best = findMatchingCampaign(hashes);
 
   if (best) {
     const c = best.c;
@@ -484,6 +509,77 @@ function importCampaign(m) {
   saveCampaign(c);
   console.log(`[campaign] ${c.id} 导入完成：${turns.length} 轮（${c.meta.title || '无标题'}）`);
   return { ok: true, campaignId: c.id, turns: turns.length, merged: false, catchupRemaining: turns.length };
+}
+
+// ---------- 战役管理（面板经 /admin 触发；约定一个对话文件绑定一份记忆档案） ----------
+// 定位：用当前对话的指纹找到对应战役，返回管理卡片所需概要
+function locateCampaign(m) {
+  const turns = normalizeImportTurns(m);
+  if (turns.length < 3) return { ok: true, found: false, reason: '当前对话有效消息不足 3 条' };
+  const best = findMatchingCampaign(turns.map(turnHash));
+  if (!best) return { ok: true, found: false };
+  return { ok: true, found: true, ...campaignBrief(best.c) };
+}
+
+function getCampaignOr(m) {
+  const c = campaigns.get(String(m.campaignId || ''));
+  if (!c) throw new Error('战役不存在');
+  return c;
+}
+
+// 读五个档案 md 的全文（供面板编辑器）
+function readMemoryFiles(m) {
+  const c = getCampaignOr(m);
+  const files = MEMORY_MD_FILES.map(f => {
+    const p = path.join(c.dir, f);
+    return { name: f, content: fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '' };
+  });
+  return { ok: true, campaignId: c.id, files };
+}
+
+// 面板保存单个档案 md（白名单限定，记忆任务运行中拒绝以免和 agent 写入冲突）
+function saveMemoryFile(m) {
+  const c = getCampaignOr(m);
+  if (c.memoryJobRunning || c._catchupRunning) throw new Error('记忆任务运行中，稍后再保存');
+  const name = String(m.name || '');
+  if (!MEMORY_MD_FILES.includes(name)) throw new Error('不在档案文件白名单内');
+  fs.mkdirSync(c.dir, { recursive: true });
+  fs.writeFileSync(path.join(c.dir, name), String(m.content ?? ''));
+  console.log(`[campaign] ${c.id} ${name} 已由面板编辑保存（${Buffer.byteLength(String(m.content ?? ''))} 字节）`);
+  return { ok: true, campaignId: c.id, name };
+}
+
+// 删除 = 移入 memory/trash/（软删除，可手动恢复）
+function deleteCampaign(m) {
+  const c = getCampaignOr(m);
+  if (c.memoryJobRunning || c._catchupRunning) throw new Error('记忆任务运行中，稍后再删除');
+  const trashDir = path.join(MEMORY_ROOT, 'trash');
+  fs.mkdirSync(trashDir, { recursive: true });
+  const dest = path.join(trashDir, `${c.id}-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}`);
+  fs.renameSync(c.dir, dest);
+  campaigns.delete(c.id);
+  console.log(`[campaign] ${c.id} 已删除（移入 ${dest}，可手动恢复）`);
+  return { ok: true, campaignId: c.id, trash: dest };
+}
+
+// 重建档案：现有 md 备份为 *.pre-rebuild.bak 后清空，从头补课重新生成
+function rebuildCampaign(m) {
+  const c = getCampaignOr(m);
+  if (c.memoryJobRunning || c._catchupRunning) throw new Error('记忆任务运行中，稍后再重建');
+  if (!c.transcript.length) throw new Error('战役没有对话原文，无法重建');
+  for (const f of MEMORY_MD_FILES) {
+    const p = path.join(c.dir, f);
+    if (fs.existsSync(p)) {
+      fs.copyFileSync(p, p + '.pre-rebuild.bak');
+      fs.unlinkSync(p);
+    }
+  }
+  c.meta.catchupTo = 0;
+  c.meta.catchupTarget = c.transcript.length;
+  saveCampaign(c);
+  console.log(`[campaign] ${c.id} 档案已清空（备份 *.pre-rebuild.bak），开始重建（${c.transcript.length} 轮）`);
+  runCatchup(c); // 后台跑，进度经 catchup 广播
+  return { ok: true, campaignId: c.id, turns: c.transcript.length };
 }
 
 // ---------- 记忆 ----------
@@ -1198,6 +1294,15 @@ server.on('upgrade', (req, socket, head) => {
         try { result = importCampaign(m); }
         catch (e) { result = { ok: false, error: e.message }; }
         ws.send(JSON.stringify({ type: 'importResult', ...result }));
+      } else if (['locate', 'memoryFiles', 'saveMemoryFile', 'deleteCampaign', 'rebuild'].includes(m.type)) {
+        const handlers = {
+          locate: locateCampaign, memoryFiles: readMemoryFiles,
+          saveMemoryFile, deleteCampaign, rebuild: rebuildCampaign,
+        };
+        let result;
+        try { result = handlers[m.type](m); }
+        catch (e) { result = { ok: false, error: e.message }; }
+        ws.send(JSON.stringify({ type: m.type + 'Result', ...result }));
       } else if (m.type === 'catchup') {
         const campaign = campaigns.get(String(m.campaignId || ''));
         if (!campaign) {
