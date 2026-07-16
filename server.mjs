@@ -107,6 +107,8 @@ const CONFIG_SCHEMA = {
     desc: '默认 medium：比 high 显著缩短更新耗时，档案质量实测无损' },
   MEMORY_MAX_TURNS: { group: '记忆', label: '工具回合上限', type: 'int', min: 4, def: 30,
     desc: '记忆 agent 的最大工具回合数，长回复+5文件读写实测可超 15' },
+  CATCHUP_BATCH: { group: '记忆', label: '补课批大小', type: 'int', min: 5, def: 15,
+    desc: '导入旧对话后"补课"时，每批喂给记忆 agent 的轮数；批越大总批次越少，单批耗时越长' },
   MEMORY_API_URL: { group: '记忆', label: 'API 地址', type: 'str', def: '' },
   MEMORY_API_KEY: { group: '记忆', label: 'API 密钥', type: 'str', secret: true, def: '' },
   MEMORY_API_MODEL: { group: '记忆', label: 'API 模型', type: 'str', def: '' },
@@ -210,9 +212,23 @@ function recallModeNow() {
 
 // ---------- 用量统计 ----------
 const START_TS = Date.now();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 const newBucket = () => ({ calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 const usageTotals = { chat: newBucket(), memory: newBucket(), recall: newBucket() };
 const kfmt = n => (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
+
+// 缓存命中率 = 缓存读 ÷ 提示词总量（新输入+缓存读+缓存写），无提示词时为 null
+function hitPct(n) {
+  const total = n.input + n.cacheRead + n.cacheWrite;
+  return total > 0 ? Math.round((n.cacheRead / total) * 100) : null;
+}
+
+// 发给面板的累计命中率摘要（进程生命周期内的平均）
+function usageSummary() {
+  const out = {};
+  for (const [k, b] of Object.entries(usageTotals)) out[k] = { calls: b.calls, hit: hitPct(b) };
+  return out;
+}
 
 // 兼容 SDK（input_tokens/cache_*）与 OpenAI（prompt_tokens/completion_tokens）两种用量格式
 function normalizeUsage(u) {
@@ -243,7 +259,11 @@ function trackUsage(pathName, campaign, rawUsage) {
     campaign.meta.tokens[pathName] ??= newBucket();
     addUsage(campaign.meta.tokens[pathName], n);
   }
-  const cache = n.cacheRead || n.cacheWrite ? `, cache r${kfmt(n.cacheRead)}/w${kfmt(n.cacheWrite)}` : '';
+  broadcastAdmin({ type: 'usage', usage: usageSummary() });
+  const p = hitPct(n);
+  const cache = n.cacheRead || n.cacheWrite
+    ? `, cache r${kfmt(n.cacheRead)}/w${kfmt(n.cacheWrite)}${p == null ? '' : `, 命中 ${p}%`}`
+    : '';
   return ` [tokens: in ${kfmt(n.input)}, out ${kfmt(n.output)}${cache}]`;
 }
 
@@ -382,6 +402,90 @@ function reconcile(campaign, incoming) {
   return { transcript: stored.slice(0, bestI).concat(incoming), discarded };
 }
 
+// ---------- 旧对话导入（面板经 /admin 通道触发） ----------
+// 扩展从 ST 前端取当前对话全楼层发来。已有匹配战役则并入（把只见过滑动窗口的
+// 存档补全成完整历史），否则新建战役。合并时若检测到早期楼层补全导致轮号整体
+// 偏移，自动修正 timeline 里的 #N 标注（原文件先备份）。
+function computeImportOffset(campaign, importedHashes) {
+  const firstPos = new Map();
+  importedHashes.forEach((h, j) => { if (!firstPos.has(h)) firstPos.set(h, j); });
+  const votes = new Map();
+  campaign.hashes.forEach((h, i) => {
+    const j = firstPos.get(h);
+    if (j !== undefined) votes.set(j - i, (votes.get(j - i) || 0) + 1);
+  });
+  let best = null, bestVotes = 0, total = 0;
+  for (const [off, v] of votes) { total += v; if (v > bestVotes) { bestVotes = v; best = off; } }
+  // 需要 ≥3 票且占多数、且方向是"导入比存档多出前缀"，否则认为无法确定偏移
+  if (best === null || best < 0 || bestVotes < 3 || bestVotes * 2 < total) return null;
+  return best;
+}
+
+function shiftTimeline(campaign, offset) {
+  const p = path.join(campaign.dir, 'timeline.md');
+  if (!fs.existsSync(p) || offset <= 0) return;
+  const text = fs.readFileSync(p, 'utf8');
+  fs.writeFileSync(path.join(campaign.dir, 'timeline.pre-import.bak'), text);
+  // 轮号标注既有单号（#12）也有范围（#12-13，单个 # 带范围），一次性匹配整体平移
+  fs.writeFileSync(p, text.replace(/#(\d+)((?:\s*[-~～—]\s*)?)(\d*)/g, (_, a, sep, b) =>
+    '#' + (Number(a) + offset) + (b ? sep + (Number(b) + offset) : sep)));
+  console.log(`[campaign] ${campaign.id} timeline 轮号整体 +${offset}（原文件备份为 timeline.pre-import.bak）`);
+}
+
+function importCampaign(m) {
+  const turns = (Array.isArray(m.turns) ? m.turns : [])
+    .filter(t => t && (t.role === 'user' || t.role === 'assistant')
+      && typeof t.content === 'string' && t.content.trim())
+    .map(t => ({ role: t.role, content: t.content }));
+  if (turns.length < 3) return { ok: false, error: '有效消息不足 3 条，无法导入' };
+  const hashes = turns.map(turnHash);
+
+  let best = null;
+  for (const c of campaigns.values()) {
+    const n = hashes.reduce((s, h) => s + (c.hashSet.has(h) ? 1 : 0), 0);
+    if (n >= 3 && (!best || n > best.n)) best = { c, n };
+  }
+
+  if (best) {
+    const c = best.c;
+    if (c.memoryJobRunning || c._catchupRunning) {
+      return { ok: false, error: `匹配到战役 ${c.id}，但其记忆任务正在运行，请稍后再试` };
+    }
+    if (turns.length < c.transcript.length) {
+      return { ok: false, error: `匹配到战役 ${c.id}（已存档 ${c.transcript.length} 轮），导入内容只有 ${turns.length} 轮，为防误覆盖已取消` };
+    }
+    const offset = computeImportOffset(c, hashes);
+    if (offset && offset > 0) shiftTimeline(c, offset);
+    c.transcript = turns;
+    refreshHashes(c);
+    c.meta.lastSeen = Date.now();
+    // 补课范围推进：偏移 >0 说明补全了早期楼层，未覆盖区从头开始、上界整体平移；
+    // 偏移 =0 是纯尾部对齐，补课进度不动；偏移无法确定时不动，交给用户核对
+    if (offset && offset > 0) {
+      const prevPending = Math.max(0, (c.meta.catchupTarget ?? 0) - (c.meta.catchupTo ?? 0));
+      c.meta.catchupTarget = offset + (prevPending > 0 ? (c.meta.catchupTarget ?? 0) : 0);
+      c.meta.catchupTo = 0;
+    }
+    saveCampaign(c);
+    console.log(`[campaign] ${c.id} 导入并入：现共 ${turns.length} 轮`
+      + (offset ? `，补全早期 ${offset} 轮` : offset === 0 ? '，无新增早期楼层' : '，轮号偏移无法确定（timeline 标注请自行核对）'));
+    return {
+      ok: true, campaignId: c.id, turns: turns.length, merged: true, offset,
+      catchupRemaining: Math.max(0, Number(c.meta.catchupTarget ?? 0) - Number(c.meta.catchupTo ?? 0)),
+    };
+  }
+
+  const c = createCampaign(turns.find(t => t.role === 'user')?.content);
+  c.transcript = turns;
+  refreshHashes(c);
+  if (m.title && String(m.title).trim()) c.meta.title = String(m.title).trim().slice(0, 60);
+  c.meta.catchupTo = 0;
+  c.meta.catchupTarget = turns.length;
+  saveCampaign(c);
+  console.log(`[campaign] ${c.id} 导入完成：${turns.length} 轮（${c.meta.title || '无标题'}）`);
+  return { ok: true, campaignId: c.id, turns: turns.length, merged: false, catchupRemaining: turns.length };
+}
+
 // ---------- 记忆 ----------
 function readMemory(campaign) {
   if (!fs.existsSync(campaign.dir)) return '';
@@ -487,6 +591,12 @@ async function updateMemoryApi(campaign, lastUserText, replyText, notes, started
     console.log(`[memory] ${campaign.id} 判定无需更新 (api, ${((Date.now() - startedAt) / 1000).toFixed(1)}s)${tag}`);
     return;
   }
+  const written = writeMemoryFiles(campaign, out);
+  console.log(`[memory] ${campaign.id} 更新完成 (api, ${((Date.now() - startedAt) / 1000).toFixed(1)}s, ${written} 个文件)${tag}`);
+}
+
+// 解析"全文件重写"协议输出并落盘，返回写入的文件数（api 模式与补课 api 模式共用）
+function writeMemoryFiles(campaign, out) {
   const parts = out.split(/^===FILE:\s*([A-Za-z0-9_.\-]+)\s*===\s*$/m);
   let written = 0;
   fs.mkdirSync(campaign.dir, { recursive: true });
@@ -499,7 +609,7 @@ async function updateMemoryApi(campaign, lastUserText, replyText, notes, started
     written++;
   }
   if (!written) throw new Error('api 输出无法解析出任何档案文件');
-  console.log(`[memory] ${campaign.id} 更新完成 (api, ${((Date.now() - startedAt) / 1000).toFixed(1)}s, ${written} 个文件)${tag}`);
+  return written;
 }
 
 async function updateMemory(campaign, lastUserText, replyText) {
@@ -522,6 +632,113 @@ async function updateMemory(campaign, lastUserText, replyText) {
     console.error(`[memory] ${campaign.id} 更新失败:`, e.message);
   } finally {
     campaign.memoryJobRunning = false;
+  }
+}
+
+// ---------- 补课（导入旧对话后的档案回填） ----------
+// 分批把已归档但未记账的早期轮次喂给记忆 agent，构建 timeline（含轮号标注）等
+// 档案。批间落盘 meta.catchupTo，中断后重新触发即可续跑；每批复用 memoryJobRunning
+// 互斥，与在线对话的常规记忆更新互不重入（补课批运行期间，当轮更新会照常跳过）。
+const CATCHUP_RULES = '补课规则：timeline 按时间顺序为这批轮次补写条目（骨架格式，每条 200 字内只记骨架：时间地点、人物、事件与结果、数值变化；条目末尾标注来源轮号如（#12-13），轮号已在每条消息的属性中直接给出，照抄即可）。world_state/party/npc_ledger/foreshadowing 更新到这批轮次为止的最新状态（后续批次会继续推进，不必预判）。聊天原文中的变量标记、状态栏/前端代码、思维链推演等非叙事内容一律不要写入档案。不要为核对而去通读 transcript 的其他部分——快进快出。';
+
+function catchupBlock(campaign, from, to) {
+  const lines = [];
+  for (let i = from; i < to; i++) {
+    const t = campaign.transcript[i];
+    lines.push(`<turn 轮号="#${i + 1}" role="${t.role}">`, (t.content || '').slice(0, 6000), '</turn>');
+  }
+  return `<archived_turns range="#${from + 1}-#${to}">\n${lines.join('\n')}\n</archived_turns>`;
+}
+
+async function catchupBatchSdk(campaign, from, to) {
+  const prompt = [
+    '你是战役记忆管理器。这是一次"补课"：战役对话原文已完整归档，但档案尚未覆盖下面这批早期轮次。请通读这批原文，把其中的叙事事实补入当前目录下的战役档案（Markdown 文件）。',
+    '维护这些文件（不存在则创建）：',
+    ...MEMORY_FILE_SPEC,
+    CATCHUP_RULES,
+    '',
+    catchupBlock(campaign, from, to),
+  ].join('\n');
+  let tag = '';
+  for await (const msg of query({
+    prompt,
+    options: {
+      model: CFG.MEMORY_MODEL || CFG.BRIDGE_MODEL,
+      cwd: campaign.dir,
+      allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep'],
+      permissionMode: 'acceptEdits',
+      settingSources: [],
+      maxTurns: CFG.MEMORY_MAX_TURNS,
+      ...(CFG.MEMORY_EFFORT ? { effort: CFG.MEMORY_EFFORT } : {}),
+    },
+  })) {
+    if (msg.type === 'result') {
+      tag = trackUsage('memory', campaign, msg.usage);
+      if (msg.subtype !== 'success') throw new Error(`SDK result: ${msg.subtype}`);
+    }
+  }
+  return tag;
+}
+
+async function catchupBatchApi(campaign, from, to) {
+  const current = MEMORY_MD_FILES.map(f => {
+    const p = path.join(campaign.dir, f);
+    const text = fs.existsSync(p) ? fs.readFileSync(p, 'utf8').slice(0, 12000) : '（尚不存在）';
+    return `===FILE: ${f}===\n${text}`;
+  }).join('\n\n');
+  const system = [
+    '你是战役记忆管理器。这是一次"补课"：战役对话原文已完整归档，但档案尚未覆盖这批早期轮次。档案文件及用途：',
+    ...MEMORY_FILE_SPEC,
+    CATCHUP_RULES,
+    '输出格式：仅输出有变化的文件；每个文件以单独一行 ===FILE: 文件名=== 开头，紧跟该文件更新后的完整内容；除此之外不要输出任何解释。若这批轮次无需任何更新，只输出 NO_UPDATE。',
+  ].join('\n');
+  const prompt = `<current_files>\n${current}\n</current_files>\n\n${catchupBlock(campaign, from, to)}`;
+  const { text: out, usage } = await openaiChat({ url: CFG.MEMORY_API_URL, key: CFG.MEMORY_API_KEY, model: CFG.MEMORY_API_MODEL }, system, prompt);
+  const tag = trackUsage('memory', campaign, usage);
+  if (!/^\s*NO_UPDATE\b/.test(out.trim())) writeMemoryFiles(campaign, out);
+  return tag;
+}
+
+async function runCatchup(campaign) {
+  if (campaign._catchupRunning) {
+    broadcastAdmin({ type: 'catchup', campaignId: campaign.id, status: 'error', error: '补课已在进行中' });
+    return;
+  }
+  const target = Math.min(Number(campaign.meta.catchupTarget ?? campaign.transcript.length), campaign.transcript.length);
+  let from = Math.max(0, Number(campaign.meta.catchupTo ?? 0));
+  if (from >= target) {
+    console.log(`[memory] ${campaign.id} 补课：无待覆盖轮次（已至 #${from}/#${target}）`);
+    broadcastAdmin({ type: 'catchup', campaignId: campaign.id, status: 'done', done: from, total: target });
+    return;
+  }
+  campaign._catchupRunning = true;
+  console.log(`[memory] ${campaign.id} 补课开始：#${from + 1}-#${target}，每批 ${CFG.CATCHUP_BATCH} 轮`);
+  try {
+    while (from < target) {
+      const to = Math.min(from + CFG.CATCHUP_BATCH, target);
+      while (campaign.memoryJobRunning) await sleep(3000); // 等常规记忆更新让位
+      campaign.memoryJobRunning = true;
+      const startedAt = Date.now();
+      try {
+        const tag = memoryModeNow() === 'api'
+          ? await catchupBatchApi(campaign, from, to)
+          : await catchupBatchSdk(campaign, from, to);
+        console.log(`[memory] ${campaign.id} 补课 #${from + 1}-#${to} 完成 (${((Date.now() - startedAt) / 1000).toFixed(1)}s)${tag}`);
+      } finally {
+        campaign.memoryJobRunning = false;
+      }
+      from = to;
+      campaign.meta.catchupTo = from;
+      saveCampaign(campaign);
+      broadcastAdmin({ type: 'catchup', campaignId: campaign.id, status: 'running', done: from, total: target });
+    }
+    console.log(`[memory] ${campaign.id} 补课完成：档案已覆盖 #1-#${target}`);
+    broadcastAdmin({ type: 'catchup', campaignId: campaign.id, status: 'done', done: target, total: target });
+  } catch (e) {
+    console.error(`[memory] ${campaign.id} 补课中断（已完成到 #${from}，再次触发补课即可续跑）:`, e.message);
+    broadcastAdmin({ type: 'catchup', campaignId: campaign.id, status: 'error', error: e.message, done: from, total: target });
+  } finally {
+    campaign._catchupRunning = false;
   }
 }
 
@@ -915,6 +1132,7 @@ function statsSnapshot() {
   }
   return {
     uptimeSec: Math.floor((Date.now() - START_TS) / 1000),
+    hitRates: usageSummary(),
     totals: { ...usageTotals, all },
     campaigns: [...campaigns.values()]
       .filter(c => c.meta.tokens)
@@ -975,6 +1193,18 @@ server.on('upgrade', (req, socket, head) => {
         resetConfig();
       } else if (m.type === 'stats') {
         ws.send(JSON.stringify({ type: 'stats', stats: statsSnapshot() }));
+      } else if (m.type === 'import') {
+        let result;
+        try { result = importCampaign(m); }
+        catch (e) { result = { ok: false, error: e.message }; }
+        ws.send(JSON.stringify({ type: 'importResult', ...result }));
+      } else if (m.type === 'catchup') {
+        const campaign = campaigns.get(String(m.campaignId || ''));
+        if (!campaign) {
+          ws.send(JSON.stringify({ type: 'catchup', status: 'error', error: '战役不存在', campaignId: m.campaignId }));
+        } else {
+          runCatchup(campaign); // 后台跑，进度经 broadcast 推送
+        }
       }
     });
     ws.send(JSON.stringify({
@@ -982,6 +1212,7 @@ server.on('upgrade', (req, socket, head) => {
       schema: CONFIG_SCHEMA,
       config: publicConfig(),
       info: { port: PORT, memoryRoot: MEMORY_ROOT, pid: process.pid, campaigns: campaigns.size, uptimeSec: Math.floor((Date.now() - START_TS) / 1000) },
+      usage: usageSummary(),
       logs: logRing,
     }));
   });
