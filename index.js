@@ -35,6 +35,15 @@
                     <input id="tcb-connect" class="menu_button" type="button" value="连接">
                 </div>
                 <div id="tcb-info" class="tcb-info">尚未连接到桥。桥需运行 2026-07-15 之后的版本（含 /admin 管理通道）。</div>
+                <div id="tcb-usage" class="tcb-info"></div>
+                <div id="tcb-camp" class="tcb-camp" style="display:none">
+                    <div class="tcb-group-title">战役工具</div>
+                    <div class="tcb-camp-row">
+                        <input id="tcb-import" class="menu_button tcb-mini" type="button" value="导入当前对话"
+                               title="把 ST 当前打开对话的全部楼层归档进桥的战役档案（已有匹配战役则补全合并），之后可选择让记忆 agent 分批补课构建档案">
+                        <span id="tcb-camp-status" class="tcb-camp-status"></span>
+                    </div>
+                </div>
                 <div id="tcb-groups"></div>
                 <div id="tcb-reset-row" class="tcb-reset-row" style="display:none">
                     <input id="tcb-reset" class="menu_button tcb-mini" type="button" value="恢复默认设置">
@@ -83,6 +92,20 @@
     }
 
     // ---------- 消息处理 ----------
+    function toast(kind, text, title) {
+        if (window.toastr && window.toastr[kind]) window.toastr[kind](text, title);
+        else alert((title ? title + ': ' : '') + text);
+        appendLocal(`${title ? title + '：' : ''}${text}`, kind === 'error' ? 'tcb-err' : 'tcb-sep');
+    }
+
+    function renderUsage(u) {
+        if (!u) return;
+        const part = (k, label) => (u[k] && u[k].calls
+            ? `${label} ${u[k].hit == null ? '—' : u[k].hit + '%'}（${u[k].calls} 次）` : null);
+        const parts = [part('chat', '回复'), part('memory', '记忆'), part('recall', '回溯')].filter(Boolean);
+        $id('tcb-usage').textContent = parts.length ? `缓存平均命中率（自桥启动）· ${parts.join(' · ')}` : '';
+    }
+
     function handleMessage(m) {
         if (m.type === 'hello') {
             schema = m.schema;
@@ -90,10 +113,29 @@
             const i = m.info || {};
             $id('tcb-info').textContent =
                 `桥 PID ${i.pid} · 端口 ${i.port}（重启生效项）· 战役 ${i.campaigns} 个 · 档案根: ${i.memoryRoot}`;
+            renderUsage(m.usage);
             $id('tcb-reset-row').style.display = '';
+            $id('tcb-camp').style.display = '';
             $id('tcb-log').replaceChildren();
             for (const entry of m.logs || []) appendLog(entry);
             appendLocal('—— 已连接，以上为回放日志 ——', 'tcb-sep');
+        } else if (m.type === 'usage') {
+            renderUsage(m.usage);
+        } else if (m.type === 'importResult') {
+            if (!m.ok) return toast('error', m.error, '导入失败');
+            toast('success', `${m.merged ? '并入现有战役' : '新建战役'} ${m.campaignId}，现共 ${m.turns} 轮`, '导入成功');
+            const remaining = m.catchupRemaining ?? 0;
+            if (remaining > 0 && confirm(
+                `导入完成。是否立即在后台"补课"——让记忆 agent 分批通读这 ${remaining} 轮旧对话、构建战役档案（编年史/状态账本等）？\n\n`
+                + '补课在后台分批执行，期间可以照常游戏；中断后再次导入并触发补课即可续跑。')) {
+                send({ type: 'catchup', campaignId: m.campaignId });
+                $id('tcb-camp-status').textContent = '补课已启动…';
+            }
+        } else if (m.type === 'catchup') {
+            const el = $id('tcb-camp-status');
+            if (m.status === 'running') el.textContent = `补课中：已覆盖 ${m.done}/${m.total} 轮`;
+            else if (m.status === 'done') { el.textContent = ''; toast('success', `档案已覆盖 ${m.total} 轮`, '补课完成'); }
+            else if (m.status === 'error') { el.textContent = ''; toast('error', `${m.error}（已完成 ${m.done ?? '?'} 轮，可再次触发续跑）`, '补课中断'); }
         } else if (m.type === 'config') {
             updateInputs(m.config);
         } else if (m.type === 'setResult') {
@@ -184,6 +226,26 @@
         }
     }
 
+    // ---------- 旧对话导入 ----------
+    // 从 ST 前端上下文取当前对话的完整楼层（客户端内存里是全量，不受上下文截断影响），
+    // 经 /admin 通道交给桥归档。角色扮演消息映射：is_user → user，其余 → assistant；
+    // is_system（注释/隐藏楼层）跳过。
+    function importCurrentChat() {
+        if (!ws || ws.readyState !== 1) return toast('error', '未连接到桥', '导入失败');
+        let ctx = null;
+        try { ctx = window.SillyTavern && SillyTavern.getContext(); } catch { /* 下面统一报错 */ }
+        const chat = ctx && ctx.chat;
+        if (!Array.isArray(chat) || !chat.length) return toast('error', '当前没有打开的对话', '导入失败');
+        const turns = chat
+            .filter(msg => msg && !msg.is_system && typeof msg.mes === 'string' && msg.mes.trim())
+            .map(msg => ({ role: msg.is_user ? 'user' : 'assistant', content: msg.mes }));
+        if (turns.length < 3) return toast('error', '当前对话有效消息不足 3 条', '导入失败');
+        const title = String(ctx.name2 || turns.find(t => t.role === 'user')?.content || '').slice(0, 60);
+        if (!confirm(`将把当前对话的 ${turns.length} 条消息导入桥的战役档案（已有匹配战役则补全合并，不影响其他战役）。继续？`)) return;
+        toast('info', `正在导入 ${turns.length} 条消息…`, '导入');
+        send({ type: 'import', title, turns });
+    }
+
     // ---------- 日志视图 ----------
     function logClass(entry) {
         if (entry.level === 'error') return 'tcb-err';
@@ -224,6 +286,7 @@
         $id('tcb-connect').addEventListener('click', connect);
         $id('tcb-clear').addEventListener('click', () => $id('tcb-log').replaceChildren());
         $id('tcb-stats').addEventListener('click', () => send({ type: 'stats' }));
+        $id('tcb-import').addEventListener('click', importCurrentChat);
         $id('tcb-reset').addEventListener('click', () => {
             if (!confirm('将清空面板改过的全部配置（含 API 密钥），回落到桥启动时的环境变量或内置默认，并即时生效。确定恢复默认设置？')) return;
             send({ type: 'reset' });
