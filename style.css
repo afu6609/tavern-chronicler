@@ -1,43 +1,150 @@
+/* Tavern Chronicler 面板 — DnD 5e 角色卡风格：羊皮纸底、暗红标题、鎏金分隔、墨池日志。
+   全部颜色显式指定（不吃 ST 主题变量），深浅主题下观感一致；字体走本地衬线栈，零外部请求。 */
+
+.tcb-settings {
+    --tcb-parchment: #f0e6cd;
+    --tcb-parchment-deep: #e6d8b4;
+    --tcb-ink: #3a2c18;
+    --tcb-ink-soft: #6b5a3e;
+    --tcb-red: #58180d;
+    --tcb-gold: #c9ad6a;
+    --tcb-serif: 'Palatino Linotype', 'Book Antiqua', Georgia, 'Times New Roman', serif;
+    font-family: var(--tcb-serif);
+}
+
+.tcb-settings .inline-drawer {
+    border: 2px solid #7a5c2e;
+    border-radius: 8px;
+    overflow: hidden;
+    background:
+        radial-gradient(ellipse at 15% 0%, rgba(255, 252, 240, 0.55), transparent 55%),
+        radial-gradient(ellipse at 90% 100%, rgba(122, 92, 46, 0.18), transparent 50%),
+        linear-gradient(160deg, var(--tcb-parchment), var(--tcb-parchment-deep));
+    box-shadow: inset 0 0 24px rgba(93, 69, 31, 0.25), 0 1px 4px rgba(0, 0, 0, 0.4);
+}
+
+.tcb-settings .inline-drawer-header {
+    background: linear-gradient(180deg, #6d2015, var(--tcb-red)) !important;
+    color: #f0e0b8 !important;
+    border-bottom: 2px solid var(--tcb-gold);
+    padding: 6px 10px;
+}
+.tcb-settings .inline-drawer-header b {
+    font-family: var(--tcb-serif);
+    font-variant: small-caps;
+    letter-spacing: 1.5px;
+    font-size: 1.05em;
+}
+.tcb-settings .tcb-d20 { color: var(--tcb-gold); }
+.tcb-settings .inline-drawer-icon { color: #f0e0b8; }
+
+.tcb-settings .inline-drawer-content {
+    padding: 10px 12px 12px;
+    color: var(--tcb-ink);
+}
+
+/* ---------- 连接区 ---------- */
 .tcb-conn { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
 .tcb-conn #tcb-url { flex: 1; min-width: 0; }
-.tcb-dot { width: 10px; height: 10px; border-radius: 50%; background: #888; flex: 0 0 auto; }
-.tcb-dot.on { background: #4caf50; }
-.tcb-dot.err { background: #e05555; }
+.tcb-dot { width: 11px; height: 11px; border-radius: 50%; background: #8a7a5c; flex: 0 0 auto; border: 1px solid #5d451f; box-shadow: inset 0 0 3px rgba(0,0,0,.4); }
+.tcb-dot.on { background: #3f7d3a; }
+.tcb-dot.err { background: #9c2b1e; }
 
-.tcb-info { font-size: 0.75em; opacity: 0.7; margin-bottom: 6px; word-break: break-all; }
+.tcb-info { font-size: 0.78em; color: var(--tcb-ink-soft); margin-bottom: 5px; word-break: break-all; font-style: italic; }
 
-.tcb-group-title { font-weight: bold; margin: 10px 0 4px; padding-bottom: 2px; border-bottom: 1px solid var(--SmartThemeBorderColor, #555); }
+/* ---------- 表单 ---------- */
+.tcb-group-title {
+    font-family: var(--tcb-serif);
+    font-variant: small-caps;
+    letter-spacing: 1px;
+    font-weight: bold;
+    font-size: 1.02em;
+    color: var(--tcb-red);
+    margin: 12px 0 4px;
+    padding-bottom: 2px;
+    border-bottom: 2px solid var(--tcb-gold);
+}
 .tcb-row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
-.tcb-row > label { flex: 0 0 42%; font-size: 0.85em; cursor: help; }
+.tcb-row > label { flex: 0 0 42%; font-size: 0.88em; cursor: help; color: var(--tcb-ink); }
 .tcb-row > input, .tcb-row > select, .tcb-row > textarea { flex: 1; min-width: 0; }
-.tcb-row > textarea { font-size: 0.8em; }
-.tcb-sent { outline: 1px solid #4caf50; }
+
+.tcb-settings input.text_pole,
+.tcb-settings select.text_pole,
+.tcb-settings textarea.text_pole {
+    background: #faf3df !important;
+    color: var(--tcb-ink) !important;
+    border: 1px solid #a58e5f !important;
+    border-radius: 4px;
+    font-family: var(--tcb-serif);
+    box-shadow: inset 0 1px 3px rgba(93, 69, 31, 0.2);
+}
+.tcb-settings select.text_pole option { background: #faf3df; color: var(--tcb-ink); }
+.tcb-row > textarea { font-size: 0.82em; }
+.tcb-sent { outline: 2px solid #3f7d3a !important; }
+
+/* ---------- 按钮 ---------- */
+.tcb-settings input.menu_button {
+    background: linear-gradient(180deg, #8a6d3b, #6b5127) !important;
+    color: #f6ecd7 !important;
+    border: 1px solid #4d3a1c !important;
+    border-radius: 4px;
+    font-family: var(--tcb-serif);
+    font-variant: small-caps;
+    letter-spacing: 0.5px;
+    text-shadow: 0 1px 1px rgba(0, 0, 0, 0.45);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+.tcb-settings input.menu_button:hover { background: linear-gradient(180deg, #9b7c46, #7a5e2f) !important; }
+.tcb-settings input.menu_button:disabled { opacity: 0.55; }
+.tcb-settings input.tcb-danger { background: linear-gradient(180deg, #7c2417, #58180d) !important; border-color: #3d0f07 !important; }
+.tcb-settings input.tcb-danger:hover { background: linear-gradient(180deg, #8f2c1c, #6a2012) !important; }
+.tcb-mini { padding: 2px 10px; font-size: 0.82em; }
 
 .tcb-reset-row { margin-top: 8px; text-align: right; }
 
-.tcb-camp-row { display: flex; align-items: center; gap: 10px; margin: 4px 0; }
-.tcb-camp-status { font-size: 0.8em; opacity: 0.8; }
+/* ---------- 战役工具 ---------- */
+.tcb-camp-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; flex-wrap: wrap; }
+.tcb-camp-status { font-size: 0.8em; color: var(--tcb-red); font-style: italic; }
+.tcb-camp-card {
+    margin: 6px 0;
+    padding: 7px 10px;
+    background: rgba(255, 251, 238, 0.55);
+    border: 1px solid var(--tcb-gold);
+    border-left: 4px solid var(--tcb-red);
+    border-radius: 4px;
+}
+.tcb-camp-info { font-size: 0.84em; white-space: pre-wrap; color: var(--tcb-ink); margin-bottom: 4px; }
+.tcb-editor { margin-top: 6px; }
+.tcb-editor textarea { width: 100%; box-sizing: border-box; font-family: Consolas, 'Courier New', monospace !important; font-size: 0.78em; line-height: 1.5; }
 
+/* ---------- 日志（墨池） ---------- */
 .tcb-log-head { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
-.tcb-log-head .checkbox_label { font-size: 0.8em; margin: 0; }
-.tcb-mini { padding: 2px 8px; font-size: 0.8em; }
+.tcb-log-head b {
+    font-variant: small-caps;
+    letter-spacing: 1px;
+    color: var(--tcb-red);
+}
+.tcb-log-head .checkbox_label { font-size: 0.8em; margin: 0; color: var(--tcb-ink); }
 
 .tcb-log {
-    font-family: var(--monoFontFamily, Consolas, monospace);
+    font-family: Consolas, 'Courier New', monospace;
     font-size: 0.72em;
-    line-height: 1.5;
+    line-height: 1.55;
     max-height: 320px;
     overflow-y: auto;
-    border: 1px solid var(--SmartThemeBorderColor, #555);
+    background: #221a12;
+    color: #d8cbb0;
+    border: 1px solid #7a5c2e;
     border-radius: 5px;
-    padding: 4px 6px;
-    margin-top: 4px;
+    padding: 5px 7px;
+    margin-top: 5px;
+    box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.6);
 }
 .tcb-line { white-space: pre-wrap; word-break: break-all; }
 .tcb-time { opacity: 0.45; margin-right: 6px; }
-.tcb-sep { opacity: 0.6; font-style: italic; }
+.tcb-sep { opacity: 0.65; font-style: italic; color: #c9ad6a; }
 .tcb-warn { color: #e0b341; }
-.tcb-err { color: #e05555; }
+.tcb-err { color: #e0654f; }
 .tcb-tag-chat { color: #7ec4f8; }
 .tcb-tag-recall { color: #b48ef0; }
 .tcb-tag-memory { color: #8fd694; }

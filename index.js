@@ -25,7 +25,7 @@
         root.innerHTML = `
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>Tavern Chronicler</b>
+                <b><i class="fa-solid fa-dice-d20 tcb-d20"></i>&nbsp;Tavern Chronicler</b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
@@ -41,7 +41,18 @@
                     <div class="tcb-camp-row">
                         <input id="tcb-import" class="menu_button tcb-mini" type="button" value="导入当前对话"
                                title="把 ST 当前打开对话的全部楼层归档进桥的战役档案（已有匹配战役则补全合并），之后可选择让记忆 agent 分批补课构建档案">
+                        <input id="tcb-locate" class="menu_button tcb-mini" type="button" value="定位战役"
+                               title="用当前对话的指纹找到对应的战役档案，进行删除/重建/编辑">
                         <span id="tcb-camp-status" class="tcb-camp-status"></span>
+                    </div>
+                    <div id="tcb-camp-card" class="tcb-camp-card" style="display:none"></div>
+                    <div id="tcb-editor" class="tcb-editor" style="display:none">
+                        <div class="tcb-camp-row">
+                            <select id="tcb-ed-file" class="text_pole"></select>
+                            <input id="tcb-ed-save" class="menu_button tcb-mini" type="button" value="保存">
+                            <input id="tcb-ed-close" class="menu_button tcb-mini" type="button" value="关闭">
+                        </div>
+                        <textarea id="tcb-ed-text" class="text_pole" rows="14" spellcheck="false"></textarea>
                     </div>
                 </div>
                 <div id="tcb-groups"></div>
@@ -124,6 +135,7 @@
         } else if (m.type === 'importResult') {
             if (!m.ok) return toast('error', m.error, '导入失败');
             toast('success', `${m.merged ? '并入现有战役' : '新建战役'} ${m.campaignId}，现共 ${m.turns} 轮`, '导入成功');
+            locateCurrentChat(true); // 刷新管理卡片
             const remaining = m.catchupRemaining ?? 0;
             if (remaining > 0 && confirm(
                 `导入完成。是否立即在后台"补课"——让记忆 agent 分批通读这 ${remaining} 轮旧对话、构建战役档案（编年史/状态账本等）？\n\n`
@@ -131,6 +143,31 @@
                 send({ type: 'catchup', campaignId: m.campaignId });
                 $id('tcb-camp-status').textContent = '补课已启动…';
             }
+        } else if (m.type === 'locateResult') {
+            if (!m.ok) return toast('error', m.error, '定位失败');
+            if (!m.found) {
+                renderCampCard(null);
+                return toast('info', m.reason || '当前对话没有对应的战役档案，可先"导入当前对话"', '未找到战役');
+            }
+            renderCampCard(m);
+        } else if (m.type === 'memoryFilesResult') {
+            if (!m.ok) return toast('error', m.error, '读取档案失败');
+            openEditor(m.campaignId, m.files);
+        } else if (m.type === 'saveMemoryFileResult') {
+            if (!m.ok) return toast('error', m.error, '保存失败');
+            edDirty = false;
+            const f = edFiles.find(x => x.name === m.name);
+            if (f) f.content = $id('tcb-ed-text').value;
+            toast('success', `${m.name} 已保存`, '档案编辑');
+        } else if (m.type === 'deleteCampaignResult') {
+            if (!m.ok) return toast('error', m.error, '删除失败');
+            renderCampCard(null);
+            closeEditor();
+            toast('success', `战役 ${m.campaignId} 已移入回收站（memory/trash/）`, '删除完成');
+        } else if (m.type === 'rebuildResult') {
+            if (!m.ok) return toast('error', m.error, '重建失败');
+            toast('info', `原档案已备份为 *.pre-rebuild.bak，开始从头补课（${m.turns} 轮）`, '档案重建已启动');
+            $id('tcb-camp-status').textContent = '重建中…';
         } else if (m.type === 'catchup') {
             const el = $id('tcb-camp-status');
             if (m.status === 'running') el.textContent = `补课中：已覆盖 ${m.done}/${m.total} 轮`;
@@ -226,24 +263,104 @@
         }
     }
 
-    // ---------- 旧对话导入 ----------
-    // 从 ST 前端上下文取当前对话的完整楼层（客户端内存里是全量，不受上下文截断影响），
-    // 经 /admin 通道交给桥归档。角色扮演消息映射：is_user → user，其余 → assistant；
-    // is_system（注释/隐藏楼层）跳过。
-    function importCurrentChat() {
-        if (!ws || ws.readyState !== 1) return toast('error', '未连接到桥', '导入失败');
+    // ---------- 旧对话导入与战役管理 ----------
+    // 从 ST 前端上下文取当前对话的完整楼层（客户端内存里是全量，不受上下文截断影响）。
+    // 角色扮演消息映射：is_user → user，其余 → assistant；is_system（/comment 注释、
+    // /hide 隐藏的楼层，ST 发提示词时本来就排除）跳过，与模型实际见过的历史一致。
+    function getCurrentTurns() {
         let ctx = null;
-        try { ctx = window.SillyTavern && SillyTavern.getContext(); } catch { /* 下面统一报错 */ }
+        try { ctx = window.SillyTavern && SillyTavern.getContext(); } catch { /* 返回 null */ }
         const chat = ctx && ctx.chat;
-        if (!Array.isArray(chat) || !chat.length) return toast('error', '当前没有打开的对话', '导入失败');
+        if (!Array.isArray(chat) || !chat.length) return null;
         const turns = chat
             .filter(msg => msg && !msg.is_system && typeof msg.mes === 'string' && msg.mes.trim())
             .map(msg => ({ role: msg.is_user ? 'user' : 'assistant', content: msg.mes }));
-        if (turns.length < 3) return toast('error', '当前对话有效消息不足 3 条', '导入失败');
-        const title = String(ctx.name2 || turns.find(t => t.role === 'user')?.content || '').slice(0, 60);
-        if (!confirm(`将把当前对话的 ${turns.length} 条消息导入桥的战役档案（已有匹配战役则补全合并，不影响其他战役）。继续？`)) return;
-        toast('info', `正在导入 ${turns.length} 条消息…`, '导入');
-        send({ type: 'import', title, turns });
+        return { turns, title: String(ctx.name2 || turns.find(t => t.role === 'user')?.content || '').slice(0, 60) };
+    }
+
+    function importCurrentChat() {
+        if (!ws || ws.readyState !== 1) return toast('error', '未连接到桥', '导入失败');
+        const cur = getCurrentTurns();
+        if (!cur) return toast('error', '当前没有打开的对话', '导入失败');
+        if (cur.turns.length < 3) return toast('error', '当前对话有效消息不足 3 条', '导入失败');
+        if (!confirm(`将把当前对话的 ${cur.turns.length} 条消息导入桥的战役档案（已有匹配战役则补全合并，不影响其他战役）。继续？`)) return;
+        toast('info', `正在导入 ${cur.turns.length} 条消息…`, '导入');
+        send({ type: 'import', title: cur.title, turns: cur.turns });
+    }
+
+    function locateCurrentChat(silent) {
+        if (!ws || ws.readyState !== 1) return silent || toast('error', '未连接到桥', '定位失败');
+        const cur = getCurrentTurns();
+        if (!cur || cur.turns.length < 3) return silent || toast('error', '当前没有打开的对话（或有效消息不足 3 条）', '定位失败');
+        send({ type: 'locate', turns: cur.turns });
+    }
+
+    let currentCampaign = null;
+
+    function renderCampCard(b) {
+        currentCampaign = b && b.found ? b : null;
+        const card = $id('tcb-camp-card');
+        card.replaceChildren();
+        if (!currentCampaign) { card.style.display = 'none'; return; }
+        card.style.display = '';
+        const covered = b.catchupTarget != null ? `${Math.min(b.catchupTo ?? 0, b.turns)}/${b.catchupTarget}` : '—';
+        const info = el('div', 'tcb-camp-info');
+        info.textContent = `${b.title || '（无标题）'}\n${b.campaignId} · ${b.turns} 轮 · 档案 ${b.files.length} 份 · 补课水位 ${covered}`
+            + (b.busy ? '\n⚠ 记忆任务运行中，管理操作暂不可用' : '');
+        const row = el('div', 'tcb-camp-row');
+        const btn = (value, onClick, danger) => {
+            const i = el('input', 'menu_button tcb-mini' + (danger ? ' tcb-danger' : ''));
+            i.type = 'button'; i.value = value; i.disabled = !!b.busy;
+            i.addEventListener('click', onClick);
+            return i;
+        };
+        row.append(
+            btn('编辑档案', () => send({ type: 'memoryFiles', campaignId: b.campaignId })),
+            btn('重建档案', () => {
+                if (!confirm(`将清空该战役的全部档案（原文件备份为 *.pre-rebuild.bak），并让记忆 agent 从头补课重建（${b.turns} 轮，分批后台执行）。确定？`)) return;
+                send({ type: 'rebuild', campaignId: b.campaignId });
+            }),
+            btn('删除战役', () => {
+                if (!confirm(`将删除战役 ${b.campaignId}（${b.turns} 轮，含对话归档与全部档案）。\n实际移入桥的 memory/trash/ 目录，可手动恢复。确定？`)) return;
+                send({ type: 'deleteCampaign', campaignId: b.campaignId });
+            }, true),
+        );
+        card.append(info, row);
+    }
+
+    // ---------- 档案编辑器 ----------
+    let edFiles = [];
+    let edCampaignId = null;
+    let edName = null;
+    let edDirty = false;
+
+    function edLoad(name) {
+        const f = edFiles.find(x => x.name === name);
+        edName = name;
+        $id('tcb-ed-text').value = f ? f.content : '';
+        edDirty = false;
+    }
+
+    function openEditor(campaignId, files) {
+        edFiles = files;
+        edCampaignId = campaignId;
+        const sel = $id('tcb-ed-file');
+        sel.replaceChildren();
+        for (const f of files) {
+            const opt = el('option', null, `${f.name}（${f.content.length} 字符）`);
+            opt.value = f.name;
+            sel.append(opt);
+        }
+        const dflt = files.some(f => f.name === 'timeline.md') ? 'timeline.md' : files[0]?.name;
+        sel.value = dflt;
+        edLoad(dflt);
+        $id('tcb-editor').style.display = '';
+    }
+
+    function closeEditor() {
+        if (edDirty && !confirm('有未保存的修改，确定关闭？')) return;
+        $id('tcb-editor').style.display = 'none';
+        edFiles = []; edCampaignId = null; edName = null; edDirty = false;
     }
 
     // ---------- 日志视图 ----------
@@ -287,6 +404,17 @@
         $id('tcb-clear').addEventListener('click', () => $id('tcb-log').replaceChildren());
         $id('tcb-stats').addEventListener('click', () => send({ type: 'stats' }));
         $id('tcb-import').addEventListener('click', importCurrentChat);
+        $id('tcb-locate').addEventListener('click', () => locateCurrentChat(false));
+        $id('tcb-ed-save').addEventListener('click', () => {
+            if (!edCampaignId || !edName) return;
+            send({ type: 'saveMemoryFile', campaignId: edCampaignId, name: edName, content: $id('tcb-ed-text').value });
+        });
+        $id('tcb-ed-close').addEventListener('click', closeEditor);
+        $id('tcb-ed-text').addEventListener('input', () => { edDirty = true; });
+        $id('tcb-ed-file').addEventListener('change', (ev) => {
+            if (edDirty && !confirm('有未保存的修改，切换将丢弃。继续？')) { ev.target.value = edName; return; }
+            edLoad(ev.target.value);
+        });
         $id('tcb-reset').addEventListener('click', () => {
             if (!confirm('将清空面板改过的全部配置（含 API 密钥），回落到桥启动时的环境变量或内置默认，并即时生效。确定恢复默认设置？')) return;
             send({ type: 'reset' });
