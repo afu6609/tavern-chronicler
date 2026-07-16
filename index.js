@@ -1,8 +1,11 @@
 // Tavern Chronicler 面板 — 连接 st-claude-bridge 的 /admin WebSocket。
 // 能力：实时修改桥配置（免环境变量、免重启，schema 由桥下发、表单自动生成）、
-// 桥日志流式查看（连上先回放环形缓冲）、用量统计快照。
+// 桥日志流式查看（连上先回放环形缓冲）、用量统计快照、旧对话导入与战役管理。
+// 布局：设置/战役/日志三页签 + 配置分组折叠（状态记忆在 localStorage），手机小屏可用。
 (() => {
     const LS_URL = 'tavernChronicler.bridgeUrl';
+    const LS_TAB = 'tavernChronicler.tab';
+    const LS_FOLD = 'tavernChronicler.folds';
     const DEFAULT_URL = 'ws://127.0.0.1:9377/admin';
     const MAX_LOG_LINES = 500;
     const RECONNECT_MS = 4000;
@@ -36,8 +39,18 @@
                 </div>
                 <div id="tcb-info" class="tcb-info">尚未连接到桥。桥需运行 2026-07-15 之后的版本（含 /admin 管理通道）。</div>
                 <div id="tcb-usage" class="tcb-info"></div>
-                <div id="tcb-camp" class="tcb-camp" style="display:none">
-                    <div class="tcb-group-title">战役工具</div>
+                <div class="tcb-tabs">
+                    <button type="button" class="tcb-tab-btn" data-tab="config"><i class="fa-solid fa-sliders"></i>设置</button>
+                    <button type="button" class="tcb-tab-btn" data-tab="camp"><i class="fa-solid fa-dungeon"></i>战役</button>
+                    <button type="button" class="tcb-tab-btn" data-tab="log"><i class="fa-solid fa-scroll"></i>日志</button>
+                </div>
+                <div id="tcb-tab-config" class="tcb-tab">
+                    <div id="tcb-groups"></div>
+                    <div class="tcb-reset-row">
+                        <input id="tcb-reset" class="menu_button tcb-mini" type="button" value="恢复默认设置">
+                    </div>
+                </div>
+                <div id="tcb-tab-camp" class="tcb-tab">
                     <div class="tcb-camp-row">
                         <input id="tcb-import" class="menu_button tcb-mini" type="button" value="导入当前对话"
                                title="把 ST 当前打开对话的全部楼层归档进桥的战役档案（已有匹配战役则补全合并），之后可选择让记忆 agent 分批补课构建档案">
@@ -55,20 +68,33 @@
                         <textarea id="tcb-ed-text" class="text_pole" rows="14" spellcheck="false"></textarea>
                     </div>
                 </div>
-                <div id="tcb-groups"></div>
-                <div id="tcb-reset-row" class="tcb-reset-row" style="display:none">
-                    <input id="tcb-reset" class="menu_button tcb-mini" type="button" value="恢复默认设置">
+                <div id="tcb-tab-log" class="tcb-tab">
+                    <div class="tcb-log-head">
+                        <b>桥日志</b>
+                        <label class="checkbox_label"><input id="tcb-autoscroll" type="checkbox" checked><span>自动滚动</span></label>
+                        <input id="tcb-stats" class="menu_button tcb-mini" type="button" value="用量">
+                        <input id="tcb-clear" class="menu_button tcb-mini" type="button" value="清空">
+                    </div>
+                    <div id="tcb-log" class="tcb-log"></div>
                 </div>
-                <div class="tcb-log-head">
-                    <b>桥日志</b>
-                    <label class="checkbox_label"><input id="tcb-autoscroll" type="checkbox" checked><span>自动滚动</span></label>
-                    <input id="tcb-stats" class="menu_button tcb-mini" type="button" value="用量">
-                    <input id="tcb-clear" class="menu_button tcb-mini" type="button" value="清空">
-                </div>
-                <div id="tcb-log" class="tcb-log"></div>
             </div>
         </div>`;
         return root;
+    }
+
+    // ---------- 页签 ----------
+    function switchTab(name) {
+        for (const b of document.querySelectorAll('.tcb-tab-btn'))
+            b.classList.toggle('active', b.dataset.tab === name);
+        for (const p of ['config', 'camp', 'log'])
+            $id('tcb-tab-' + p).classList.toggle('active', p === name);
+        localStorage.setItem(LS_TAB, name);
+        if (name === 'log') {
+            document.querySelector('.tcb-tab-btn[data-tab="log"]').classList.remove('tcb-badge');
+            // 隐藏期间 scrollTop 写不进去（scrollHeight 为 0），切回来补滚一次
+            const box = $id('tcb-log');
+            if ($id('tcb-autoscroll').checked) box.scrollTop = box.scrollHeight;
+        }
     }
 
     // ---------- 连接管理 ----------
@@ -125,8 +151,6 @@
             $id('tcb-info').textContent =
                 `桥 PID ${i.pid} · 端口 ${i.port}（重启生效项）· 战役 ${i.campaigns} 个 · 档案根: ${i.memoryRoot}`;
             renderUsage(m.usage);
-            $id('tcb-reset-row').style.display = '';
-            $id('tcb-camp').style.display = '';
             $id('tcb-log').replaceChildren();
             for (const entry of m.logs || []) appendLog(entry);
             appendLocal('—— 已连接，以上为回放日志 ——', 'tcb-sep');
@@ -192,15 +216,31 @@
     }
 
     // ---------- 配置表单（按桥下发的 schema 生成） ----------
+    function loadFolds() {
+        try { return JSON.parse(localStorage.getItem(LS_FOLD)) || {}; } catch { return {}; }
+    }
+
     function renderGroups(config) {
         const wrap = $id('tcb-groups');
         wrap.replaceChildren();
+        const folds = loadFolds();
         const groups = new Map();
         for (const [key, s] of Object.entries(schema)) {
             if (!groups.has(s.group)) {
                 const g = el('div', 'tcb-group');
-                g.append(el('div', 'tcb-group-title', s.group));
-                groups.set(s.group, g);
+                const title = el('div', 'tcb-group-title');
+                title.append(el('i', 'fa-solid fa-chevron-down tcb-caret'), document.createTextNode(s.group));
+                const body = el('div', 'tcb-group-body');
+                // 默认折叠、记住展开状态：面板才不至于一屏拉不完
+                if (folds[s.group] !== 'open') g.classList.add('tcb-folded');
+                title.addEventListener('click', () => {
+                    g.classList.toggle('tcb-folded');
+                    const f = loadFolds();
+                    f[s.group] = g.classList.contains('tcb-folded') ? 'closed' : 'open';
+                    localStorage.setItem(LS_FOLD, JSON.stringify(f));
+                });
+                g.append(title, body);
+                groups.set(s.group, body);
                 wrap.append(g);
             }
             groups.get(s.group).append(buildRow(key, s, config[key]));
@@ -376,6 +416,9 @@
         box.append(node);
         while (box.childElementCount > MAX_LOG_LINES) box.firstElementChild.remove();
         if ($id('tcb-autoscroll').checked) box.scrollTop = box.scrollHeight;
+        // 日志页签不在前台时出现警告/错误 → 页签角落亮红点提醒
+        if (/tcb-(err|warn)/.test(node.className) && !$id('tcb-tab-log').classList.contains('active'))
+            document.querySelector('.tcb-tab-btn[data-tab="log"]').classList.add('tcb-badge');
     }
 
     function appendLog(entry) {
@@ -399,6 +442,9 @@
             || document.getElementById('extensions_settings');
         if (!host) return;
         host.append(buildPanel());
+        for (const b of document.querySelectorAll('.tcb-tab-btn'))
+            b.addEventListener('click', () => switchTab(b.dataset.tab));
+        switchTab(localStorage.getItem(LS_TAB) || 'config');
         $id('tcb-url').value = localStorage.getItem(LS_URL) || DEFAULT_URL;
         $id('tcb-connect').addEventListener('click', connect);
         $id('tcb-clear').addEventListener('click', () => $id('tcb-log').replaceChildren());
@@ -416,6 +462,7 @@
             edLoad(ev.target.value);
         });
         $id('tcb-reset').addEventListener('click', () => {
+            if (!ws || ws.readyState !== 1) return toast('error', '未连接到桥', '恢复默认');
             if (!confirm('将清空面板改过的全部配置（含 API 密钥），回落到桥启动时的环境变量或内置默认，并即时生效。确定恢复默认设置？')) return;
             send({ type: 'reset' });
         });

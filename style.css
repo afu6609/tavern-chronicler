@@ -52,18 +52,72 @@
 
 .tcb-info { font-size: 0.78em; color: var(--tcb-ink-soft); margin-bottom: 5px; word-break: break-all; font-style: italic; }
 
+/* ---------- 页签（设置 / 战役 / 日志） ---------- */
+.tcb-tabs {
+    display: flex;
+    gap: 5px;
+    margin-top: 8px;
+    padding: 0 3px;
+    border-bottom: 2px solid var(--tcb-gold);
+}
+.tcb-settings .tcb-tab-btn {
+    flex: 1 1 0;
+    padding: 4px 4px 3px;
+    position: relative;
+    cursor: pointer;
+    font-family: var(--tcb-serif);
+    font-variant: small-caps;
+    letter-spacing: 1px;
+    font-size: 0.92em;
+    color: var(--tcb-ink);
+    background: linear-gradient(180deg, #e6d8b4, #d2c091);
+    border: 1px solid #a58e5f;
+    border-bottom: none;
+    border-radius: 7px 7px 0 0;
+    box-shadow: inset 0 -4px 6px rgba(93, 69, 31, 0.18);
+}
+.tcb-settings .tcb-tab-btn i { margin-right: 5px; font-size: 0.85em; color: #7a5c2e; }
+.tcb-settings .tcb-tab-btn.active {
+    background: linear-gradient(180deg, #6d2015, var(--tcb-red));
+    color: #f0e0b8;
+    border-color: #3d0f07;
+    box-shadow: none;
+}
+.tcb-settings .tcb-tab-btn.active i { color: var(--tcb-gold); }
+.tcb-tab-btn.tcb-badge::after {
+    content: '';
+    position: absolute;
+    top: 4px;
+    right: 6px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #c73a24;
+    box-shadow: 0 0 3px rgba(199, 58, 36, 0.85);
+}
+.tcb-tab { display: none; padding-top: 4px; }
+.tcb-tab.active { display: block; }
+
 /* ---------- 表单 ---------- */
 .tcb-group-title {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    cursor: pointer;
+    user-select: none;
     font-family: var(--tcb-serif);
     font-variant: small-caps;
     letter-spacing: 1px;
     font-weight: bold;
     font-size: 1.02em;
     color: var(--tcb-red);
-    margin: 12px 0 4px;
+    margin: 10px 0 4px;
     padding-bottom: 2px;
     border-bottom: 2px solid var(--tcb-gold);
 }
+.tcb-caret { font-size: 0.72em; color: #7a5c2e; transition: transform 0.15s; }
+.tcb-folded .tcb-caret { transform: rotate(-90deg); }
+.tcb-folded .tcb-group-body { display: none; }
 .tcb-row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
 .tcb-row > label { flex: 0 0 42%; font-size: 0.88em; cursor: help; color: var(--tcb-ink); }
 .tcb-row > input, .tcb-row > select, .tcb-row > textarea { flex: 1; min-width: 0; }
@@ -118,7 +172,7 @@
 .tcb-editor textarea { width: 100%; box-sizing: border-box; font-family: Consolas, 'Courier New', monospace !important; font-size: 0.78em; line-height: 1.5; }
 
 /* ---------- 日志（墨池） ---------- */
-.tcb-log-head { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+.tcb-log-head { display: flex; align-items: center; gap: 10px; margin-top: 2px; flex-wrap: wrap; }
 .tcb-log-head b {
     font-variant: small-caps;
     letter-spacing: 1px;
@@ -151,3 +205,13 @@
 .tcb-tag-dice { color: #f0a35e; }
 .tcb-tag-campaign { color: #6ec6c0; }
 .tcb-tag-config { color: #d8d05e; }
+
+/* ---------- 小屏（手机）适配 ---------- */
+@media (max-width: 520px) {
+    .tcb-settings .inline-drawer-content { padding: 8px 8px 10px; }
+    .tcb-row { flex-wrap: wrap; row-gap: 2px; margin: 6px 0; }
+    .tcb-row > label { flex: 1 1 100%; }
+    .tcb-row > input, .tcb-row > select, .tcb-row > textarea { flex: 1 1 100%; }
+    .tcb-settings .tcb-tab-btn { letter-spacing: 0; padding: 5px 2px 4px; }
+    .tcb-log { max-height: 45vh; }
+}
