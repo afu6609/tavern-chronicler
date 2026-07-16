@@ -93,6 +93,8 @@ const CONFIG_SCHEMA = {
   RECALL_THINKING_BUDGET: { group: '回溯', label: '出词思考上限', type: 'int', min: 0, def: 2000,
     desc: '思考 token 硬上限，防止回忆密集轮长考超时；0=不设限的自适应' },
   RECALL_BUDGET: { group: '回溯', label: '注入字符预算', type: 'int', min: 500, def: 6000 },
+  RECALL_BM25: { group: '回溯', label: 'BM25 模糊排序', type: 'enum', values: ['on', 'off'], lower: true, def: 'on',
+    desc: '给关键词检索叠一层中文 1/2-gram BM25 打分：命中超预算时按相关度取舍，字面失配时模糊兜底（纯本地计数，零额外调用）' },
   RECALL_TIMEOUT: { group: '回溯', label: '超时 (ms)', type: 'int', min: 1000, def: 120000,
     desc: '整个回溯的超时，超时放弃不阻塞回复。命中多时要出词+压缩两次调用（各约 20-60s），调小会掐掉恰恰最有价值的回溯' },
   RECALL_API_URL: { group: '回溯', label: 'API 地址', type: 'str', def: '', desc: 'api 模式的 OpenAI 兼容端点' },
@@ -543,6 +545,7 @@ function saveMemoryFile(m) {
   if (c.memoryJobRunning || c._catchupRunning) throw new Error('记忆任务运行中，稍后再保存');
   const name = String(m.name || '');
   if (!MEMORY_MD_FILES.includes(name)) throw new Error('不在档案文件白名单内');
+  backupMemoryFiles(c, 'manual');
   fs.mkdirSync(c.dir, { recursive: true });
   fs.writeFileSync(path.join(c.dir, name), String(m.content ?? ''));
   console.log(`[campaign] ${c.id} ${name} 已由面板编辑保存（${Buffer.byteLength(String(m.content ?? ''))} 字节）`);
@@ -557,6 +560,7 @@ function deleteCampaign(m) {
   fs.mkdirSync(trashDir, { recursive: true });
   const dest = path.join(trashDir, `${c.id}-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}`);
   fs.renameSync(c.dir, dest);
+  fs.rmSync(path.join(MEMORY_ROOT, 'backups', c.id), { recursive: true, force: true }); // 滚动备份随战役一并清理
   campaigns.delete(c.id);
   console.log(`[campaign] ${c.id} 已删除（移入 ${dest}，可手动恢复）`);
   return { ok: true, campaignId: c.id, trash: dest };
@@ -623,6 +627,26 @@ const MEMORY_FILE_SPEC = [
 ];
 const MEMORY_RULES = '只记录本轮新增或变化的信息；保持每个文件精炼（超过约 200 行时压缩旧内容）。聊天原文中的变量标记、状态栏/前端代码、思维链推演等非叙事内容一律不要写入档案，只提炼其中的叙事事实。本轮交互的轮号已在交互块属性中直接给出，新条目照抄即可；不要重复核对、改写既有条目的轮号标注，也不要为校验轮号去通读 transcript——每轮更新应当只围绕本轮新信息，快进快出。';
 const MEMORY_MD_FILES = ['world_state.md', 'party.md', 'npc_ledger.md', 'timeline.md', 'foreshadowing.md'];
+
+// 记忆任务每次动笔前把现有档案滚动备份到 memory/backups/<战役id>/<时间戳>-<来源>/，
+// 环形保留最近 10 份——agent 万一改坏文件（或某批补课跑偏）可手工拷回。放在战役目录
+// 之外是刻意的：sdk 模式记忆 agent 的 cwd 在战役目录内，别让它 Glob 到旧备份产生混淆。
+const BACKUP_KEEP = 10;
+function backupMemoryFiles(campaign, reason) {
+  try {
+    const files = MEMORY_MD_FILES.filter(f => fs.existsSync(path.join(campaign.dir, f)));
+    if (!files.length) return;
+    const root = path.join(MEMORY_ROOT, 'backups', campaign.id);
+    const dir = path.join(root, `${new Date().toISOString().replace(/[-:TZ.]/g, '')}-${reason}`);
+    fs.mkdirSync(dir, { recursive: true });
+    for (const f of files) fs.copyFileSync(path.join(campaign.dir, f), path.join(dir, f));
+    const all = fs.readdirSync(root).sort();
+    for (const d of all.slice(0, Math.max(0, all.length - BACKUP_KEEP)))
+      fs.rmSync(path.join(root, d), { recursive: true, force: true });
+  } catch (e) {
+    console.warn(`[memory] ${campaign.id} 档案滚动备份失败（不阻塞更新）:`, e.message);
+  }
+}
 
 function memoryExchangeBlock(lastUserText, replyText, notes, replyNo) {
   return [
@@ -714,6 +738,7 @@ async function updateMemory(campaign, lastUserText, replyText) {
     return;
   }
   campaign.memoryJobRunning = true;
+  backupMemoryFiles(campaign, 'auto');
   const notes = campaign.pendingNotes.splice(0);
   const startedAt = Date.now();
   // 回复刚被 push 进 transcript，其 1-based 轮号即当前长度；极端和解（整体替换）可能
@@ -814,6 +839,7 @@ async function runCatchup(campaign) {
       const to = Math.min(from + CFG.CATCHUP_BATCH, target);
       while (campaign.memoryJobRunning) await sleep(3000); // 等常规记忆更新让位
       campaign.memoryJobRunning = true;
+      backupMemoryFiles(campaign, 'catchup');
       const startedAt = Date.now();
       try {
         const tag = memoryModeNow() === 'api'
@@ -873,14 +899,86 @@ const withTimeout = (p, ms, tag) => Promise.race([
   p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${tag} 超时 (${ms}ms)`)), ms)),
 ]);
 
-// 进程内检索：只扫提示词窗口之外的早期轮次，命中轮附带前后各一轮上下文。
-// turnSpecs 为轮号指针（"12" 或 "30-35"，对应 timeline 里的 #N 标注），直接按号取原文，
-// 是关键词逐字匹配不到时的兜底导航。
-function searchArchive(campaign, queries, turnSpecs = []) {
+// ---------- BM25（中文 1/2-gram 免词典分词） ----------
+// 给关键词字面检索补两块短板：①命中超预算时按相关度取舍，而非按轮号先到先得；
+// ②字面失配时模糊兜底——出词给"星陨匕首"、原文写"星陨石匕首"，靠双字碎片重叠仍能搭上。
+// 分词不用词典：汉字逐字（unigram）+ 相邻双字（bigram），拉丁字母/数字按整词；
+// IDF 自动把"的/了"这类常见字压成近零权重，稀有双字（专有名词碎片）权重最高，
+// 相当于免费得到一个能认自造名词的"伪分词"。打分是经典 Okapi BM25 三件套：
+// 词频饱和（k1）、稀有词加权（IDF）、长文惩罚（b）。
+const BM25_K1 = 1.5, BM25_B = 0.75;
+
+function bmTokens(text) {
+  const tokens = [];
+  const re = /[a-z0-9_]+|[㐀-鿿]+/gi;
+  const s = String(text || '').toLowerCase();
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    if (/[㐀-鿿]/.test(m[0])) {
+      const chars = [...m[0]];
+      tokens.push(...chars);
+      for (let i = 0; i < chars.length - 1; i++) tokens.push(chars[i] + chars[i + 1]);
+    } else tokens.push(m[0]);
+  }
+  return tokens;
+}
+
+// 对可检索范围内的每一轮打 BM25 分。语料就是这些轮次本身、每次现算：几百轮也只是
+// 几十毫秒的纯计数（相对出词模型的秒级调用可忽略），不值得为省它维护持久索引
+// （重roll 截尾、导入和解整体替换的失效处理反而更容易出错）。
+function bm25Scores(transcript, searchable, queryTokens) {
+  // 双字/整词是"强 token"：一轮至少命中一个强 token 才有资格得分，
+  // 只靠单字重叠的命中全是噪音。查询里一个强 token 都没有时直接不打分。
+  const strong = queryTokens.filter(tok => [...tok].length >= 2);
+  const scores = new Float64Array(searchable);
+  if (!strong.length) return scores;
+  const querySet = new Set(queryTokens);
+  const docs = [];
+  const df = new Map(); // 只统计查询 token 的文档频次（IDF 只用得到它们）
+  let totalLen = 0;
+  for (let i = 0; i < searchable; i++) {
+    const tf = new Map();
+    const toks = bmTokens(transcript[i].content);
+    for (const tok of toks) tf.set(tok, (tf.get(tok) || 0) + 1);
+    for (const tok of tf.keys()) if (querySet.has(tok)) df.set(tok, (df.get(tok) || 0) + 1);
+    docs.push({ tf, len: toks.length });
+    totalLen += toks.length;
+  }
+  const avgLen = totalLen / Math.max(1, searchable) || 1;
+  for (let i = 0; i < searchable; i++) {
+    const d = docs[i];
+    if (!strong.some(tok => d.tf.has(tok))) continue;
+    let score = 0;
+    for (const tok of queryTokens) {
+      const tf = d.tf.get(tok) || 0;
+      if (!tf) continue;
+      const n = df.get(tok) || 0;
+      const idf = Math.log(1 + (searchable - n + 0.5) / (n + 0.5));
+      score += idf * (tf * (BM25_K1 + 1)) / (tf + BM25_K1 * (1 - BM25_B + BM25_B * d.len / avgLen));
+    }
+    scores[i] = score;
+  }
+  return scores;
+}
+
+// 进程内检索：只扫提示词窗口之外的早期轮次。四级候选按优先级取舍：
+//   pinned（轮号指针直取）> literal（关键词字面命中，命中轮±1 作 neighbor 陪同）> fuzzy（BM25 模糊兜底）
+// 同级内按 BM25 相关度排序，预算吃紧时留最相关的；最终按轮号升序呈现。
+// RECALL_BM25=off 时退回纯字面匹配（不打分、无模糊），级内按轮号先后。
+function selectArchiveHits(campaign, queries, turnSpecs = []) {
+  const t0 = Date.now();
   const t = campaign.transcript;
   const searchable = Math.max(0, campaign._searchableTo ?? (t.length - CFG.RECENT_TURNS));
-  if (!searchable) return [];
-  const hit = new Set();
+  const empty = { searchable, hits: [], counts: { pinned: 0, literal: 0, neighbor: 0, fuzzy: 0 }, tookMs: 0 };
+  if (!searchable) return empty;
+  const RANK = { pinned: 3, literal: 2, neighbor: 1, fuzzy: 0 };
+  const cand = new Map(); // i -> { i, kind, score }
+  const put = (i, kind, score = 0) => {
+    const prev = cand.get(i);
+    if (!prev) { cand.set(i, { i, kind, score }); return; }
+    if (RANK[kind] > RANK[prev.kind]) prev.kind = kind;
+    if (score > prev.score) prev.score = score;
+  };
   for (const spec of turnSpecs) {
     const m = String(spec).match(/^#?\s*(\d+)(?:\s*[-~～—]\s*#?(\d+))?$/);
     if (!m) continue;
@@ -889,28 +987,48 @@ function searchArchive(campaign, queries, turnSpecs = []) {
     b = Math.min(b, a + 19); // 单个范围最多展开 20 轮，防误写大范围；总量仍受 RECALL_BUDGET 截断
     for (let n = a; n <= b; n++) {
       const i = n - 1; // 轮号 1-based → 数组下标
-      if (i >= 0 && i < searchable) hit.add(i);
+      if (i >= 0 && i < searchable) put(i, 'pinned');
     }
   }
+  const useBm25 = CFG.RECALL_BM25 === 'on' && queries.length > 0;
+  const queryTokens = useBm25 ? [...new Set(queries.flatMap(q => bmTokens(q)))] : [];
+  const scores = useBm25 ? bm25Scores(t, searchable, queryTokens) : null;
   for (const q of queries) {
     const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
     for (let i = 0; i < searchable; i++) {
       if (re.test(t[i].content || '')) {
-        if (i > 0) hit.add(i - 1);
-        hit.add(i);
-        if (i + 1 < searchable) hit.add(i + 1);
+        const s = scores ? scores[i] : 0;
+        put(i, 'literal', s);
+        if (i > 0) put(i - 1, 'neighbor', s);
+        if (i + 1 < searchable) put(i + 1, 'neighbor', s);
       }
     }
   }
-  const out = [];
+  if (scores) {
+    // 模糊兜底：全库最高分的 30% 作相对门槛（无字面命中时门槛自然落在模糊命中自身的量级），
+    // 最多补 6 轮，不带邻轮（模糊命中是推测性的，不值得花双倍预算）。
+    let top = 0;
+    for (let i = 0; i < searchable; i++) if (scores[i] > top) top = scores[i];
+    const fuzzy = [];
+    for (let i = 0; i < searchable; i++)
+      if (scores[i] > 0 && scores[i] >= top * 0.3 && !cand.has(i)) fuzzy.push(i);
+    fuzzy.sort((a, b) => scores[b] - scores[a]);
+    for (const i of fuzzy.slice(0, 6)) put(i, 'fuzzy', scores[i]);
+  }
+  const ordered = [...cand.values()].sort((a, b) =>
+    RANK[b.kind] - RANK[a.kind] || b.score - a.score || a.i - b.i);
+  const picked = [];
   let used = 0;
-  for (const i of [...hit].sort((a, b) => a - b)) {
-    const line = `#${i + 1} [${t[i].role}] ${(t[i].content || '').replace(/\s+/g, ' ').slice(0, 600)}`;
+  for (const c of ordered) {
+    const line = `#${c.i + 1} [${t[c.i].role}] ${(t[c.i].content || '').replace(/\s+/g, ' ').slice(0, 600)}`;
     if (used + line.length > CFG.RECALL_BUDGET) break;
-    out.push(line);
+    picked.push({ ...c, line });
     used += line.length;
   }
-  return out;
+  picked.sort((a, b) => a.i - b.i);
+  const counts = { pinned: 0, literal: 0, neighbor: 0, fuzzy: 0 };
+  for (const c of picked) counts[c.kind]++;
+  return { searchable, hits: picked, counts, tookMs: Date.now() - t0 };
 }
 
 async function runRecall(campaign, lastUserText) {
@@ -939,12 +1057,15 @@ async function runRecall(campaign, lastUserText) {
     return '';
   }
   const label = [...queries, ...turnSpecs.map(s => `#${s.replace(/^#/, '')}`)].join('、');
-  const lines = searchArchive(campaign, queries, turnSpecs);
-  if (!lines.length) {
+  const sel = selectArchiveHits(campaign, queries, turnSpecs);
+  if (!sel.hits.length) {
     console.log(`[recall] ${campaign.id} 检索 [${label}] 无命中 (${Date.now() - started}ms)${tag}`);
     return '';
   }
-  let content = lines.join('\n');
+  const c = sel.counts;
+  const breakdown = [c.literal && `字面 ${c.literal}`, c.neighbor && `邻轮 ${c.neighbor}`,
+    c.pinned && `指针 ${c.pinned}`, c.fuzzy && `模糊 ${c.fuzzy}`].filter(Boolean).join('、');
+  let content = sel.hits.map(h => h.line).join('\n');
   if (content.length > 2500) { // 命中较多时再花一次调用压缩，避免注入过长
     const sSystem = '把检索到的对话片段压缩成与当前话题相关的备忘录（300字以内）。保留具体数字、名字、承诺与关键原话，并保留轮号标注（#N）。只输出备忘录正文。';
     const syn = await completeText(sSystem,
@@ -952,7 +1073,7 @@ async function runRecall(campaign, lastUserText) {
     content = syn.text;
     tag += trackUsage('recall', campaign, syn.usage);
   }
-  console.log(`[recall] ${campaign.id} 检索 [${label}] 命中 ${lines.length} 段，注入 ${content.length} 字符 (${Date.now() - started}ms)${tag}`);
+  console.log(`[recall] ${campaign.id} 检索 [${label}] 命中 ${sel.hits.length} 段（${breakdown}），注入 ${content.length} 字符 (${Date.now() - started}ms)${tag}`);
   return `\n\n<archive_recall>\n以下是根据本轮话题从对话原文归档中检索到的早期内容（#N 为轮号），可用于核对旧细节：\n${content}\n</archive_recall>`;
 }
 
@@ -1294,6 +1415,21 @@ server.on('upgrade', (req, socket, head) => {
         try { result = importCampaign(m); }
         catch (e) { result = { ok: false, error: e.message }; }
         ws.send(JSON.stringify({ type: 'importResult', ...result }));
+      } else if (m.type === 'recallProbe') {
+        // 检索调试探针：跳过出词模型，直接用给定关键词/轮号跑本地检索，返回带分数的命中明细
+        let result;
+        try {
+          const c = getCampaignOr(m);
+          const queries = (Array.isArray(m.queries) ? m.queries : [])
+            .filter(q => typeof q === 'string' && q.trim()).slice(0, 8);
+          const turns = (Array.isArray(m.turns) ? m.turns : []).map(s => String(s).trim()).filter(Boolean).slice(0, 8);
+          const sel = selectArchiveHits(c, queries, turns);
+          result = {
+            ok: true, campaignId: c.id, searchable: sel.searchable, tookMs: sel.tookMs, counts: sel.counts,
+            hits: sel.hits.map(h => ({ turn: h.i + 1, kind: h.kind, score: Math.round(h.score * 100) / 100, preview: h.line.slice(0, 120) })),
+          };
+        } catch (e) { result = { ok: false, error: e.message }; }
+        ws.send(JSON.stringify({ type: 'recallProbeResult', ...result }));
       } else if (['locate', 'memoryFiles', 'saveMemoryFile', 'deleteCampaign', 'rebuild'].includes(m.type)) {
         const handlers = {
           locate: locateCampaign, memoryFiles: readMemoryFiles,
