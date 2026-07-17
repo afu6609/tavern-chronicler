@@ -304,6 +304,20 @@
     }
 
     // ---------- 旧对话导入与战役管理 ----------
+    // 当前聊天文件标识（聊天键）："角色卡标识::聊天文件名"，群聊用 "g:群id::聊天id"。
+    // 桥用它把战役和聊天文件一对一绑定（识别第一优先级，内容指纹回退）。
+    function currentChatKey() {
+        try {
+            const ctx = SillyTavern.getContext();
+            const chatId = typeof ctx.getCurrentChatId === 'function' ? ctx.getCurrentChatId() : ctx.chatId;
+            if (!chatId) return '';
+            const scope = ctx.groupId
+                ? `g:${ctx.groupId}`
+                : (ctx.characters?.[ctx.characterId]?.avatar || 'c');
+            return `${scope}::${chatId}`.slice(0, 200);
+        } catch { return ''; }
+    }
+
     // 从 ST 前端上下文取当前对话的完整楼层（客户端内存里是全量，不受上下文截断影响）。
     // 角色扮演消息映射：is_user → user，其余 → assistant；is_system（/comment 注释、
     // /hide 隐藏的楼层，ST 发提示词时本来就排除）跳过，与模型实际见过的历史一致。
@@ -315,7 +329,11 @@
         const turns = chat
             .filter(msg => msg && !msg.is_system && typeof msg.mes === 'string' && msg.mes.trim())
             .map(msg => ({ role: msg.is_user ? 'user' : 'assistant', content: msg.mes }));
-        return { turns, title: String(ctx.name2 || turns.find(t => t.role === 'user')?.content || '').slice(0, 60) };
+        return {
+            turns,
+            chatKey: currentChatKey(),
+            title: String(ctx.name2 || turns.find(t => t.role === 'user')?.content || '').slice(0, 60),
+        };
     }
 
     function importCurrentChat() {
@@ -325,14 +343,14 @@
         if (cur.turns.length < 3) return toast('error', '当前对话有效消息不足 3 条', '导入失败');
         if (!confirm(`将把当前对话的 ${cur.turns.length} 条消息导入桥的战役档案（已有匹配战役则补全合并，不影响其他战役）。继续？`)) return;
         toast('info', `正在导入 ${cur.turns.length} 条消息…`, '导入');
-        send({ type: 'import', title: cur.title, turns: cur.turns });
+        send({ type: 'import', title: cur.title, chatKey: cur.chatKey, turns: cur.turns });
     }
 
     function locateCurrentChat(silent) {
         if (!ws || ws.readyState !== 1) return silent || toast('error', '未连接到桥', '定位失败');
         const cur = getCurrentTurns();
         if (!cur || cur.turns.length < 3) return silent || toast('error', '当前没有打开的对话（或有效消息不足 3 条）', '定位失败');
-        send({ type: 'locate', turns: cur.turns });
+        send({ type: 'locate', chatKey: cur.chatKey, turns: cur.turns });
     }
 
     let currentCampaign = null;
@@ -346,6 +364,7 @@
         const covered = b.catchupTarget != null ? `${Math.min(b.catchupTo ?? 0, b.turns)}/${b.catchupTarget}` : '—';
         const info = el('div', 'tcb-camp-info');
         info.textContent = `${b.title || '（无标题）'}\n${b.campaignId} · ${b.turns} 轮 · 档案 ${b.files.length} 份 · 补课水位 ${covered}`
+            + (b.chatKey ? `\n聊天键 ${b.chatKey}` : '\n聊天键 未绑定（下次生成/导入时自动绑定）')
             + (b.busy ? '\n⚠ 记忆任务运行中，管理操作暂不可用' : '');
         const row = el('div', 'tcb-camp-row');
         const btn = (value, onClick, danger) => {
@@ -466,6 +485,32 @@
             if (!confirm('将清空面板改过的全部配置（含 API 密钥），回落到桥启动时的环境变量或内置默认，并即时生效。确定恢复默认设置？')) return;
             send({ type: 'reset' });
         });
+        registerChatKeyStamp();
         connect();
     });
+
+    // ---------- 聊天键盖章 ----------
+    // 在 ST 组装完请求、发出之前，把当前聊天键写进 custom_include_body（ST 后端对
+    // custom 源会把它合并进真正发往端点的请求体）。只对指向本桥的请求盖章，聊天键
+    // 不外发到其他端点。盖章失败静默放弃——桥自动退回内容指纹识别。
+    function registerChatKeyStamp() {
+        try {
+            const ctx = SillyTavern.getContext();
+            ctx.eventSource.on(ctx.eventTypes.CHAT_COMPLETION_SETTINGS_READY, (data) => {
+                try {
+                    if (!data || data.chat_completion_source !== 'custom' || !data.custom_url) return;
+                    const bridgeHost = new URL(($id('tcb-url').value || DEFAULT_URL).replace(/^ws/, 'http')).host;
+                    if (new URL(data.custom_url).host !== bridgeHost) return;
+                    const key = currentChatKey();
+                    if (!key) return;
+                    const stamp = 'tavern_chat_key: ' + JSON.stringify(key);
+                    const prev = String(data.custom_include_body || '').trim();
+                    // 已有内容若是 JSON 花括号/数组形态，直接追加行会毁掉整段 YAML 解析
+                    //（ST 端解析失败会静默丢弃全部附加字段），此时不盖章、退回指纹
+                    if (prev && /^[{[]/.test(prev)) return;
+                    data.custom_include_body = prev ? prev + '\n' + stamp : stamp;
+                } catch { /* 盖章失败不阻断生成 */ }
+            });
+        } catch { /* 宿主过旧无该事件：退回纯指纹识别 */ }
+    }
 })();
