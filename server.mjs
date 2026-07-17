@@ -764,9 +764,22 @@ function writeMemoryFiles(campaign, out) {
   return written;
 }
 
+// 本轮交互未能记账（任务失败/被跳过）时，降级为修正说明挂账：下一次更新的
+// <corrections> 块里带轮号和节选要求补记，sdk 模式的 agent 还能按轮号自行
+// Read transcript.jsonl 核对全文。挂账上限防连续失败时膨胀。
+function queueMissedExchange(campaign, replyNo, lastUserText, replyText, why) {
+  if (campaign.pendingNotes.length >= 8) return;
+  campaign.pendingNotes.push(
+    `第#${replyNo - 1}-#${replyNo} 轮交互${why}未入档，请补记该轮的叙事事实（若档案已含该轮内容则忽略；`
+    + `完整原文在 transcript.jsonl 第 ${replyNo - 1}-${replyNo} 行）。节选：\n`
+    + `[用户] ${String(lastUserText || '').slice(0, 600)}\n[回复] ${String(replyText || '').slice(0, 2000)}`,
+  );
+}
+
 async function updateMemory(campaign, lastUserText, replyText) {
   if (campaign.memoryJobRunning) {
-    console.log(`[memory] ${campaign.id} 上一轮任务未结束，本轮跳过`);
+    console.log(`[memory] ${campaign.id} 上一轮任务未结束，本轮跳过（已挂账补记）`);
+    queueMissedExchange(campaign, campaign.transcript.length, lastUserText, replyText, '因上一任务未结束被跳过');
     return;
   }
   campaign.memoryJobRunning = true;
@@ -782,6 +795,7 @@ async function updateMemory(campaign, lastUserText, replyText) {
     saveCampaign(campaign); // 持久化 meta 里的用量累计
   } catch (e) {
     campaign.pendingNotes.unshift(...notes); // 失败不丢修正，下一轮补上
+    queueMissedExchange(campaign, replyNo, lastUserText, replyText, '因任务失败'); // 交互本身也补记
     console.error(`[memory] ${campaign.id} 更新失败:`, e.message);
   } finally {
     campaign.memoryJobRunning = false;
