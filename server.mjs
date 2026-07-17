@@ -335,25 +335,49 @@ function loadCampaigns() {
   }
 }
 
-function createCampaign(firstUserText) {
+function createCampaign(firstUserText, chatKey = '') {
   const id = 'c-' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
     + '-' + Math.random().toString(36).slice(2, 6);
   const c = makeCampaign(id, {
     createdAt: Date.now(),
     lastSeen: Date.now(),
     title: (firstUserText || '').slice(0, 40),
+    ...(chatKey ? { chatKey } : {}),
   }, []);
   campaigns.set(id, c);
-  console.log(`[campaign] 新战役 ${id}`);
+  console.log(`[campaign] 新战役 ${id}${chatKey ? `（绑定聊天键 ${chatKey}）` : ''}`);
   return c;
 }
 
-// 指纹匹配规则：
-// - 长对话（≥3 轮）：命中 min(3, 轮数-1) 条即续接。命中里必然含生成的 GM 回复，
-//   等于同一聊天的唯一指纹（最后一条用户消息总是新的，所以阈值按 轮数-1 封顶）。
-// - 短对话（≤2 轮，开场阶段）：要求全部命中且目标战役同样年轻（存档 ≤ 轮数+1），
-//   用来区分"重roll第一条回复"和"用同一开场白开的新聊天"。
-function resolveCampaign(turns) {
+// 聊天键归一化：ST 扩展盖章送达的"角色卡标识::聊天文件名"（群聊为 g:群id::聊天id）
+const normChatKey = (v) => (typeof v === 'string' ? v.trim().slice(0, 200) : '');
+
+// 把指纹匹配到的战役与聊天键绑定。只在战役尚无聊天键时认领——已有不同键说明
+// 聊天文件被改名/分支/复制（新旧文件内容指纹相同），维持指纹匹配、不抢绑定，
+// 避免两个文件反复互抢同一个键。
+function bindChatKey(c, chatKey) {
+  if (!chatKey) return '';
+  if (!c.meta.chatKey) { c.meta.chatKey = chatKey; return '，绑定聊天键'; }
+  if (c.meta.chatKey !== chatKey) return '，聊天键有变（改名/分支？维持指纹匹配）';
+  return '';
+}
+
+// 战役识别，两级：
+// 1. 聊天键（有则优先）：扩展随请求盖章的聊天文件标识，一个对话文件绑定一份记忆，
+//    不受预设改变历史形态（压缩/脚手架）的影响。
+// 2. 内容指纹（回退，面板未装/其他前端也能用）：
+//    - 长对话（≥3 轮）：命中 min(3, 轮数-1) 条即续接。命中里必然含生成的 GM 回复，
+//      等于同一聊天的唯一指纹（最后一条用户消息总是新的，所以阈值按 轮数-1 封顶）。
+//    - 短对话（≤2 轮，开场阶段）：要求全部命中且目标战役同样年轻（存档 ≤ 轮数+1），
+//      用来区分"重roll第一条回复"和"用同一开场白开的新聊天"。
+function resolveCampaign(turns, chatKey = '') {
+  if (chatKey) {
+    const bound = [...campaigns.values()].find(c => c.meta.chatKey === chatKey);
+    if (bound) {
+      console.log(`[campaign] 续接 ${bound.id}（聊天键绑定）`);
+      return bound;
+    }
+  }
   const hashes = turns.map(turnHash);
   const scored = [...campaigns.values()]
     .map(c => ({ c, n: hashes.reduce((s, h) => s + (c.hashSet.has(h) ? 1 : 0), 0) }))
@@ -364,17 +388,17 @@ function resolveCampaign(turns) {
     ? best.n === hashes.length && best.c.transcript.length <= hashes.length + 1
     : best.n >= Math.min(3, hashes.length - 1));
   if (ok) {
-    console.log(`[campaign] 续接 ${best.c.id}（${best.n}/${hashes.length} 轮吻合）`);
+    console.log(`[campaign] 续接 ${best.c.id}（${best.n}/${hashes.length} 轮吻合${bindChatKey(best.c, chatKey)}）`);
     return best.c;
   }
   const legacy = [...campaigns.values()].find(c => c.meta.adoptNextChat);
   if (legacy && turns.length > 2) {
     delete legacy.meta.adoptNextChat;
-    console.log(`[campaign] 旧档案 ${legacy.id} 认领当前对话`);
+    console.log(`[campaign] 旧档案 ${legacy.id} 认领当前对话${bindChatKey(legacy, chatKey)}`);
     return legacy;
   }
   const firstUser = turns.find(t => t.role === 'user');
-  return createCampaign(firstUser && firstUser.content);
+  return createCampaign(firstUser && firstUser.content, chatKey);
 }
 
 // 把本次请求的对话与存档和解：在存档里找 incoming[0] 的锚点（取后续连续吻合最长的那个），
@@ -463,6 +487,7 @@ function campaignBrief(c) {
     catchupTo: c.meta.catchupTo ?? null,
     catchupTarget: c.meta.catchupTarget ?? null,
     busy: !!(c.memoryJobRunning || c._catchupRunning),
+    chatKey: c.meta.chatKey || '',
     files,
   };
 }
@@ -470,6 +495,7 @@ function campaignBrief(c) {
 function importCampaign(m) {
   const turns = normalizeImportTurns(m);
   if (turns.length < 3) return { ok: false, error: '有效消息不足 3 条，无法导入' };
+  const chatKey = normChatKey(m.chatKey);
   const hashes = turns.map(turnHash);
   const best = findMatchingCampaign(hashes);
 
@@ -483,6 +509,7 @@ function importCampaign(m) {
     }
     const offset = computeImportOffset(c, hashes);
     if (offset && offset > 0) shiftTimeline(c, offset);
+    bindChatKey(c, chatKey);
     c.transcript = turns;
     refreshHashes(c);
     c.meta.lastSeen = Date.now();
@@ -502,7 +529,7 @@ function importCampaign(m) {
     };
   }
 
-  const c = createCampaign(turns.find(t => t.role === 'user')?.content);
+  const c = createCampaign(turns.find(t => t.role === 'user')?.content, chatKey);
   c.transcript = turns;
   refreshHashes(c);
   if (m.title && String(m.title).trim()) c.meta.title = String(m.title).trim().slice(0, 60);
@@ -514,13 +541,18 @@ function importCampaign(m) {
 }
 
 // ---------- 战役管理（面板经 /admin 触发；约定一个对话文件绑定一份记忆档案） ----------
-// 定位：用当前对话的指纹找到对应战役，返回管理卡片所需概要
+// 定位：聊天键优先、内容指纹回退，返回管理卡片所需概要
 function locateCampaign(m) {
+  const chatKey = normChatKey(m.chatKey);
+  if (chatKey) {
+    const bound = [...campaigns.values()].find(c => c.meta.chatKey === chatKey);
+    if (bound) return { ok: true, found: true, via: 'chatKey', ...campaignBrief(bound) };
+  }
   const turns = normalizeImportTurns(m);
   if (turns.length < 3) return { ok: true, found: false, reason: '当前对话有效消息不足 3 条' };
   const best = findMatchingCampaign(turns.map(turnHash));
   if (!best) return { ok: true, found: false };
-  return { ok: true, found: true, ...campaignBrief(best.c) };
+  return { ok: true, found: true, via: 'fingerprint', ...campaignBrief(best.c) };
 }
 
 function getCampaignOr(m) {
@@ -1152,9 +1184,18 @@ function buildPrompt(body) {
   const lastUser = [...turns].reverse().find(t => t.role === 'user');
   const lastUserText = lastUser ? lastUser.content : '';
 
+  // 聊天键：ST 扩展经 custom_include_body 随请求盖章的当前聊天文件标识，
+  // 战役识别的第一优先级（见 resolveCampaign）
+  const chatKey = normChatKey(body.tavern_chat_key);
+  // 压缩形态防呆：clewd/squash 类预设会把全部历史压成一条巨型消息，轮次结构已不可信。
+  // 此时不关联战役——不归档、不记忆、不回溯，纯转发生成，避免把预设脚手架写进档案。
+  const malformed = turns.some(t => (t.content || '').length > 60000);
+  if (malformed && turns.length) {
+    console.warn('[campaign] 检测到超长单条消息（疑似预设压缩历史/clewd 形态），本请求不关联战役：归档、记忆、回溯均停用');
+  }
   let campaign = null;
-  if (turns.length) {
-    campaign = resolveCampaign(turns);
+  if (turns.length && !malformed) {
+    campaign = resolveCampaign(turns, chatKey);
     const { transcript, discarded } = reconcile(campaign, turns);
     campaign.transcript = transcript;
     refreshHashes(campaign);
