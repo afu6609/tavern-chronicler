@@ -99,6 +99,8 @@ Windows 下也可以直接双击仓库里的 `start.bat`（SillyTavern 用它自
 | `PORT` | `9377` | 监听端口（重启生效） |
 | `CHAT_MODE` | `sdk` | 回复通道：`sdk`（Claude Code 订阅登录态）/ `api`（任意 OpenAI 兼容端点，无 Claude 订阅可用） |
 | `CHAT_API_URL` | — | api 通道端点（如 `https://api.openai.com/v1`、`https://api.x.ai/v1`），配合 `CHAT_API_KEY`、`CHAT_API_MODEL`（留空则跟随 ST 请求里的模型名） |
+| `API_TIMEOUT` | `600000` | api 通道非流式单发的总时长上限 (ms)，回复非流式、记忆 agent 每回合、回溯 api 共用；高推理档一轮可达数分钟，别调太小 |
+| `API_IDLE_TIMEOUT` | `300000` | api 通道流式空闲超时 (ms)：连续这么久收不到任何数据块（含思维增量/心跳）判定死流并断开，反代卡死靠它解锁 |
 | `BRIDGE_MODEL` | `claude-sonnet-5` | sdk 通道的默认回复模型（ST 里未选择或选择无效时的回退） |
 | `CHAT_EFFORT` | SDK 默认（`high`） | 回复模型的推理力度：`low` / `medium` / `high` / `xhigh`。调低可显著减少思考 token、加快出字，代价是叙事规划变浅 |
 | `RECALL_EFFORT` | `low` | 回溯出词模型的推理力度。提关键词是机械任务，默认 low 省时省 token |

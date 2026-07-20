@@ -89,6 +89,10 @@ const CONFIG_SCHEMA = {
   CHAT_API_KEY: { group: '模型', label: '回复 API 密钥', type: 'str', secret: true, def: '' },
   CHAT_API_MODEL: { group: '模型', label: '回复 API 模型', type: 'str', def: '',
     desc: '留空 = 跟随 ST 请求里填的模型名；填了则强制覆盖' },
+  API_TIMEOUT: { group: '模型', label: 'API 总超时 (ms)', type: 'int', min: 10000, def: 600000,
+    desc: 'api 通道非流式单发的总时长上限（回复非流式、记忆 agent 每回合、回溯 api 共用）；高推理档一轮可达数分钟，别调太小' },
+  API_IDLE_TIMEOUT: { group: '模型', label: '流空闲超时 (ms)', type: 'int', min: 5000, def: 300000,
+    desc: 'api 通道流式：连续这么久收不到任何数据块（含思维增量/心跳）判定死流并断开；反代卡死时靠它解锁' },
   BRIDGE_MODEL: { group: '模型', label: '默认回复模型', type: 'enum', values: MODELS, def: 'claude-sonnet-5',
     desc: 'sdk 通道下，ST 未指定或指定了未知模型时使用' },
   CHAT_EFFORT: { group: '模型', label: '回复推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: '', emptyLabel: '（SDK 默认 high）',
@@ -661,8 +665,7 @@ function readMemory(campaign) {
 }
 
 // ---------- OpenAI 兼容上游调用 ----------
-const API_TIMEOUT_MS = 600_000;      // 非流式单发总时长（记忆 agent 高推理档一轮可能数分钟）
-const API_IDLE_TIMEOUT_MS = 300_000; // 流式：连续这么久无任何数据块视为死流
+// 超时时长走面板配置（API_TIMEOUT / API_IDLE_TIMEOUT，热生效）
 
 // 带状态码的上游错误，供下游映射成合适的响应码（429 透传、其余 4xx/5xx → 502）
 function httpError(status, detail) {
@@ -696,7 +699,7 @@ const abortReason = (signal) =>
 
 // openaiRaw：任意 payload 的 POST /chat/completions（记忆 agent 循环、api 出词共用）
 async function openaiRaw({ url, key }, payload, { signal = null } = {}) {
-  const ab = apiAbort(API_TIMEOUT_MS, signal, `上游 ${API_TIMEOUT_MS / 1000}s 无响应`);
+  const ab = apiAbort(CFG.API_TIMEOUT, signal, `上游 ${CFG.API_TIMEOUT / 1000}s 无响应`);
   try {
     const r = await fetch(`${url}/chat/completions`, {
       method: 'POST',
@@ -722,7 +725,7 @@ async function openaiRaw({ url, key }, payload, { signal = null } = {}) {
 // reasoning 增量（只算活跃度不透传）。onOpen 在确认上游可读后才触发，调用方此时再向
 // 下游发 200，避免上游一开始就报错时只能回半截空 SSE。
 async function openaiChatStream({ url, key }, payload, onDelta, { onOpen = null, signal = null } = {}) {
-  const ab = apiAbort(API_IDLE_TIMEOUT_MS, signal, `上游流 ${API_IDLE_TIMEOUT_MS / 1000}s 无数据`);
+  const ab = apiAbort(CFG.API_IDLE_TIMEOUT, signal, `上游流 ${CFG.API_IDLE_TIMEOUT / 1000}s 无数据`);
   try {
     const doFetch = (withUsage) => fetch(`${url}/chat/completions`, {
       method: 'POST',
