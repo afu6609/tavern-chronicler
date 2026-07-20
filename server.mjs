@@ -1,16 +1,27 @@
-// st-claude-bridge — SillyTavern ↔ Claude Agent SDK 代理
-// ST 把这里当 OpenAI 兼容后端连；回复由 Agent SDK 生成（走 Claude Code 登录态），
-// 每次回复完成后，后台 agent 异步更新对应战役目录下的记忆文件。
-// 战役识别不依赖任何配置：按对话指纹（各轮内容哈希与已存档战役的重合度）自动匹配，
-// 同一张卡开多个聊天也会各自落到独立档案；ST 因上下文上限截掉早期消息也不影响匹配。
+// st-claude-bridge — SillyTavern ↔ LLM 代理（双通道）
+// ST 把这里当 OpenAI 兼容后端连。回复通道二选一（CHAT_MODE）：
+//   sdk = Claude Agent SDK（走 Claude Code 订阅登录态，零 API 费用）
+//   api = 任意 OpenAI 兼容端点（GPT/Grok 等，自备 key）——无 Claude 订阅也能用全套记忆系统
+// 每次回复完成后，后台记忆任务异步更新对应战役目录下的 Markdown 档案（sdk/agent/api 三种后端）。
+// 战役识别：聊天键（ST 扩展随请求盖章）优先，对话指纹（各轮内容哈希重合度）回退。
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { WebSocketServer } from 'ws';
+
+// Agent SDK 按需加载：只有 sdk 通道用到；纯 api 部署可以不装它
+// （package.json 里列为 optionalDependencies，安装失败不影响启动）。
+let _sdk = null;
+async function loadSdk() {
+  if (!_sdk) {
+    try { _sdk = await import('@anthropic-ai/claude-agent-sdk'); }
+    catch { throw new Error('未安装 @anthropic-ai/claude-agent-sdk，无法使用 sdk 通道；请改用 api/agent 模式，或 npm install 补装'); }
+  }
+  return _sdk;
+}
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 9377);
@@ -71,10 +82,17 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 // type: int | str | enum；lower=存前转小写；secret=面板打码；multiline=面板用多行框；
 // enum 的 values 里 '' 表示"跟随默认/不设置"。
 const CONFIG_SCHEMA = {
+  CHAT_MODE: { group: '模型', label: '回复通道', type: 'enum', values: ['sdk', 'api'], lower: true, def: 'sdk',
+    desc: 'sdk=Claude Code 订阅登录态（零 API 费用）；api=任意 OpenAI 兼容端点（GPT/Grok 等，下面三项生效），无 Claude 订阅也能用全套记忆系统' },
+  CHAT_API_URL: { group: '模型', label: '回复 API 地址', type: 'str', def: '',
+    desc: 'api 通道的 OpenAI 兼容端点，如 https://api.openai.com/v1、https://api.x.ai/v1 或中转地址' },
+  CHAT_API_KEY: { group: '模型', label: '回复 API 密钥', type: 'str', secret: true, def: '' },
+  CHAT_API_MODEL: { group: '模型', label: '回复 API 模型', type: 'str', def: '',
+    desc: '留空 = 跟随 ST 请求里填的模型名；填了则强制覆盖' },
   BRIDGE_MODEL: { group: '模型', label: '默认回复模型', type: 'enum', values: MODELS, def: 'claude-sonnet-5',
-    desc: 'ST 未指定或指定了未知模型时使用' },
+    desc: 'sdk 通道下，ST 未指定或指定了未知模型时使用' },
   CHAT_EFFORT: { group: '模型', label: '回复推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: '', emptyLabel: '（SDK 默认 high）',
-    desc: '空 = 跟随 SDK 默认（high）。低档出字快、消耗低，高档叙事更深' },
+    desc: '仅 sdk 通道生效。空 = 跟随 SDK 默认（high）。低档出字快、消耗低，高档叙事更深' },
   CONTINUE_PROMPT: { group: '模型', label: '续写指令', type: 'str', multiline: true,
     def: '衔接 transcript 最后一条消息，遵循 system 中的全部设定（包括视角、人称、文风与角色分配），自然地续写下一条回复。只输出回复正文，不要输出任何解释或前缀。',
     desc: '拼在每次请求末尾的中性续写指令，视角/人称交给预设决定' },
@@ -101,8 +119,8 @@ const CONFIG_SCHEMA = {
   RECALL_API_KEY: { group: '回溯', label: 'API 密钥', type: 'str', secret: true, def: '' },
   RECALL_API_MODEL: { group: '回溯', label: 'API 模型', type: 'str', def: '' },
 
-  MEMORY_MODE: { group: '记忆', label: '记忆模式', type: 'enum', values: ['sdk', 'api'], lower: true, def: 'sdk',
-    desc: 'sdk=agent 带文件工具增量编辑；api=自配端点全文件重写' },
+  MEMORY_MODE: { group: '记忆', label: '记忆模式', type: 'enum', values: ['sdk', 'agent', 'api'], lower: true, def: 'sdk',
+    desc: 'sdk=订阅 agent 带文件工具增量编辑；agent=自配端点的函数调用 agent（同样增量编辑，需模型支持工具调用，GPT/Grok 前沿模型适用）；api=自配端点全文件重写（不依赖工具调用，兼容性最强）。agent/api 共用下方 API 三项' },
   MEMORY_MODEL: { group: '记忆', label: '记忆模型', type: 'str', def: '', options: ['', ...MODELS], emptyLabel: '（跟随默认回复模型）',
     desc: '仅 sdk 模式生效。空 = 跟随默认回复模型，记账质量与主模型对齐；可指定便宜档位省额度' },
   MEMORY_EFFORT: { group: '记忆', label: '记忆推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: 'medium', emptyLabel: '（SDK 默认 high）',
@@ -197,12 +215,12 @@ function publicConfig() {
 
 // api 后端配置不全时的兜底判定（配置可热改，故在使用时校验而非启动时）
 function memoryModeNow() {
-  if (CFG.MEMORY_MODE !== 'api') return 'sdk';
+  if (CFG.MEMORY_MODE !== 'api' && CFG.MEMORY_MODE !== 'agent') return 'sdk';
   if (!CFG.MEMORY_API_URL || !CFG.MEMORY_API_MODEL) {
-    console.warn('[memory] MEMORY_MODE=api 但缺少 MEMORY_API_URL / MEMORY_API_MODEL，本轮回退 sdk');
+    console.warn(`[memory] MEMORY_MODE=${CFG.MEMORY_MODE} 但缺少 MEMORY_API_URL / MEMORY_API_MODEL，本轮回退 sdk`);
     return 'sdk';
   }
-  return 'api';
+  return CFG.MEMORY_MODE;
 }
 function recallModeNow() {
   if (CFG.RECALL_MODE === 'api' && (!CFG.RECALL_API_URL || !CFG.RECALL_API_MODEL)) {
@@ -210,6 +228,14 @@ function recallModeNow() {
     return 'off';
   }
   return CFG.RECALL_MODE;
+}
+function chatModeNow() {
+  if (CFG.CHAT_MODE !== 'api') return 'sdk';
+  if (!CFG.CHAT_API_URL) {
+    console.warn('[chat] CHAT_MODE=api 但未配置 CHAT_API_URL，本轮回退 sdk');
+    return 'sdk';
+  }
+  return 'api';
 }
 
 // ---------- 用量统计 ----------
@@ -235,10 +261,13 @@ function usageSummary() {
 // 兼容 SDK（input_tokens/cache_*）与 OpenAI（prompt_tokens/completion_tokens）两种用量格式
 function normalizeUsage(u) {
   if (!u) return null;
+  // OpenAI/xAI 系：prompt_tokens 含缓存命中部分（prompt_tokens_details.cached_tokens），
+  // 拆出来对齐我们的口径（input=全新输入，prompt 总量 = input + cacheRead + cacheWrite）
+  const cachedOpenai = u.prompt_tokens_details?.cached_tokens ?? 0;
   return {
-    input: u.input_tokens ?? u.prompt_tokens ?? 0,
+    input: u.input_tokens ?? (u.prompt_tokens != null ? Math.max(0, u.prompt_tokens - cachedOpenai) : 0),
     output: u.output_tokens ?? u.completion_tokens ?? 0,
-    cacheRead: u.cache_read_input_tokens ?? 0,
+    cacheRead: u.cache_read_input_tokens ?? cachedOpenai,
     cacheWrite: u.cache_creation_input_tokens ?? 0,
   };
 }
@@ -631,22 +660,69 @@ function readMemory(campaign) {
   return `\n\n<campaign_memory>\n以下是由记忆管理器维护的战役档案，是比早期对话原文更权威的当前状态来源：\n\n${parts.join('\n\n')}\n</campaign_memory>`;
 }
 
-// 通用 OpenAI 兼容单轮补全（记忆 api 模式与回溯 api 模式共用）
-async function openaiChat({ url, key, model }, system, prompt) {
+// ---------- OpenAI 兼容上游调用 ----------
+// openaiRaw：任意 payload 的 POST /chat/completions（记忆 agent 循环、api 出词共用）
+async function openaiRaw({ url, key }, payload) {
   const r = await fetch(`${url}/chat/completions`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       ...(key ? { authorization: `Bearer ${key}` } : {}),
     },
-    body: JSON.stringify({
-      model,
-      stream: false,
-      messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }],
-    }),
+    body: JSON.stringify(payload),
   });
-  if (!r.ok) throw new Error(`api HTTP ${r.status}`);
-  const j = await r.json();
+  if (!r.ok) {
+    const detail = (await r.text().catch(() => '')).slice(0, 300);
+    throw new Error(`api HTTP ${r.status}${detail ? `：${detail}` : ''}`);
+  }
+  return r.json();
+}
+
+// 流式补全：解析上游 SSE，逐段回调 onDelta，返回全文与 usage（末块携带，
+// 需上游支持 stream_options.include_usage；不带就返回 null，用量记不上但不影响出字）
+async function openaiChatStream({ url, key }, payload, onDelta) {
+  const r = await fetch(`${url}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(key ? { authorization: `Bearer ${key}` } : {}),
+    },
+    body: JSON.stringify({ ...payload, stream: true, stream_options: { include_usage: true } }),
+  });
+  if (!r.ok) {
+    const detail = (await r.text().catch(() => '')).slice(0, 300);
+    throw new Error(`api HTTP ${r.status}${detail ? `：${detail}` : ''}`);
+  }
+  let text = '';
+  let usage = null;
+  let buf = '';
+  const decoder = new TextDecoder();
+  for await (const chunk of r.body) {
+    buf += decoder.decode(chunk, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line.startsWith('data:')) continue;
+      const data = line.slice(5).trim();
+      if (!data || data === '[DONE]') continue;
+      let j;
+      try { j = JSON.parse(data); } catch { continue; }
+      if (j.usage) usage = j.usage;
+      const delta = j.choices?.[0]?.delta?.content;
+      if (delta) { text += delta; onDelta(delta); }
+    }
+  }
+  return { text, usage };
+}
+
+// 通用单轮补全（记忆 api 模式与回溯 api 模式共用）
+async function openaiChat({ url, key, model }, system, prompt) {
+  const j = await openaiRaw({ url, key }, {
+    model,
+    stream: false,
+    messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }],
+  });
   return { text: j.choices?.[0]?.message?.content || '', usage: j.usage || null };
 }
 
@@ -702,6 +778,7 @@ async function updateMemorySdk(campaign, lastUserText, replyText, notes, started
     memoryExchangeBlock(lastUserText, replyText, notes, replyNo),
   ].join('\n');
 
+  const { query } = await loadSdk();
   for await (const msg of query({
     prompt,
     options: {
@@ -764,6 +841,133 @@ function writeMemoryFiles(campaign, out) {
   return written;
 }
 
+// ---------- 记忆 agent（API 函数调用循环，MEMORY_MODE=agent） ----------
+// 面向无 Claude 订阅的部署：任意支持工具调用的 OpenAI 兼容端点（GPT/Grok 等前沿模型），
+// 与 sdk 模式一样做增量编辑。工具围栏：只可写五个档案 md、transcript 只读，
+// 全部操作锁死在战役目录内。不支持工具调用的模型请用 api（全文件重写）模式。
+const AGENT_TOOLS = [
+  { type: 'function', function: { name: 'read_file',
+    description: '读取战役档案或对话归档。name 为五个档案 md 之一或 transcript.jsonl；读 transcript 时可用 from/to（1-based 轮号）限定范围，缺省返回最后 30 轮。',
+    parameters: { type: 'object', properties: {
+      name: { type: 'string' }, from: { type: 'integer' }, to: { type: 'integer' },
+    }, required: ['name'] } } },
+  { type: 'function', function: { name: 'write_file',
+    description: '整体重写一个档案 md（内容完全替换，新建也用它）。',
+    parameters: { type: 'object', properties: {
+      name: { type: 'string' }, content: { type: 'string' },
+    }, required: ['name', 'content'] } } },
+  { type: 'function', function: { name: 'edit_file',
+    description: '在档案 md 中做精确替换：old_string 必须与文件现有内容逐字一致（含空白与换行），替换第一处出现。',
+    parameters: { type: 'object', properties: {
+      name: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' },
+    }, required: ['name', 'old_string', 'new_string'] } } },
+  { type: 'function', function: { name: 'search_transcript',
+    description: '在对话归档全文中逐字检索关键词，返回命中轮的轮号与上下文节选（最多 8 处）。',
+    parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } } },
+];
+
+function agentToolExec(campaign, name, args) {
+  if (name === 'read_file') {
+    const f = String(args.name || '');
+    if (f === 'transcript.jsonl') {
+      const t = campaign.transcript;
+      const from = Math.max(1, Number(args.from) || Math.max(1, t.length - 29));
+      const to = Math.min(t.length, Number(args.to) || t.length);
+      if (from > to) return '（范围为空）';
+      return t.slice(from - 1, to).map((x, i) => `#${from + i} [${x.role}] ${(x.content || '').slice(0, 2000)}`).join('\n');
+    }
+    if (!MEMORY_MD_FILES.includes(f)) return `错误：${f} 不在可读白名单（五个档案 md 或 transcript.jsonl）`;
+    const p = path.join(campaign.dir, f);
+    return fs.existsSync(p) ? fs.readFileSync(p, 'utf8').slice(0, 30000) : '（尚不存在）';
+  }
+  if (name === 'write_file') {
+    const f = String(args.name || '');
+    if (!MEMORY_MD_FILES.includes(f)) return `错误：${f} 不在档案白名单，禁止写入`;
+    fs.mkdirSync(campaign.dir, { recursive: true });
+    fs.writeFileSync(path.join(campaign.dir, f), String(args.content ?? ''));
+    return `已写入 ${f}（${Buffer.byteLength(String(args.content ?? ''))} 字节）`;
+  }
+  if (name === 'edit_file') {
+    const f = String(args.name || '');
+    if (!MEMORY_MD_FILES.includes(f)) return `错误：${f} 不在档案白名单，禁止写入`;
+    const p = path.join(campaign.dir, f);
+    if (!fs.existsSync(p)) return `错误：${f} 尚不存在，请用 write_file 创建`;
+    const text = fs.readFileSync(p, 'utf8');
+    const old = String(args.old_string ?? '');
+    if (!old || !text.includes(old)) return '错误：old_string 未在文件中找到（须与现文逐字一致）';
+    fs.writeFileSync(p, text.replace(old, String(args.new_string ?? '')));
+    return `已替换 ${f} 中的一处内容`;
+  }
+  if (name === 'search_transcript') {
+    const q = String(args.query || '').trim();
+    if (!q) return '错误：query 为空';
+    const hits = [];
+    for (let i = 0; i < campaign.transcript.length && hits.length < 8; i++) {
+      const c = campaign.transcript[i].content || '';
+      const at = c.indexOf(q);
+      if (at >= 0) hits.push(`#${i + 1} [${campaign.transcript[i].role}] …${c.slice(Math.max(0, at - 80), at + 220).replace(/\s+/g, ' ')}…`);
+    }
+    return hits.length ? hits.join('\n') : '无命中';
+  }
+  return `错误：未知工具 ${name}`;
+}
+
+// 函数调用循环：每回合一次上游调用，执行其 tool_calls 后把结果塞回，直到模型
+// 不再调用工具（视为完成）或超出 MEMORY_MAX_TURNS。用量跨回合累计成一份。
+async function runMemoryAgent(campaign, system, userContent) {
+  const cfg = { url: CFG.MEMORY_API_URL, key: CFG.MEMORY_API_KEY };
+  const messages = [{ role: 'system', content: system }, { role: 'user', content: userContent }];
+  const total = { prompt: 0, completion: 0, cached: 0 };
+  for (let round = 1; round <= CFG.MEMORY_MAX_TURNS; round++) {
+    const r = await openaiRaw(cfg, { model: CFG.MEMORY_API_MODEL, messages, tools: AGENT_TOOLS, stream: false });
+    const u = r.usage || {};
+    total.prompt += u.prompt_tokens || 0;
+    total.completion += u.completion_tokens || 0;
+    total.cached += u.prompt_tokens_details?.cached_tokens || 0;
+    const msg = r.choices?.[0]?.message;
+    if (!msg) throw new Error('agent 响应缺少 message');
+    messages.push(msg);
+    const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+    if (!calls.length) {
+      return {
+        rounds: round,
+        usage: { prompt_tokens: total.prompt, completion_tokens: total.completion,
+          prompt_tokens_details: { cached_tokens: total.cached } },
+      };
+    }
+    for (const call of calls) {
+      let result;
+      try { result = agentToolExec(campaign, call.function?.name, JSON.parse(call.function?.arguments || '{}')); }
+      catch (e) { result = `错误：${e.message}`; }
+      messages.push({ role: 'tool', tool_call_id: call.id, content: String(result) });
+    }
+  }
+  throw new Error(`agent 超出工具回合上限 ${CFG.MEMORY_MAX_TURNS}`);
+}
+
+const AGENT_TOOL_GUIDE = '当前档案全文已在用户消息的 <current_files> 中给出，不必再读一遍：小改动用 edit_file 精确替换（old_string 须与现文逐字一致），新建或大改用 write_file 整体重写；需要核对更早剧情时用 search_transcript 或 read_file("transcript.jsonl")。完成全部更新后以纯文本收尾（不再调用工具即视为完成）；若本轮无需任何更新，直接说明即可。';
+
+function currentFilesBlock(campaign) {
+  return MEMORY_MD_FILES.map(f => {
+    const p = path.join(campaign.dir, f);
+    const text = fs.existsSync(p) ? fs.readFileSync(p, 'utf8').slice(0, 12000) : '（尚不存在）';
+    return `===FILE: ${f}===\n${text}`;
+  }).join('\n\n');
+}
+
+async function updateMemoryAgent(campaign, lastUserText, replyText, notes, startedAt, replyNo) {
+  const system = [
+    '你是战役记忆管理器。根据最新一轮交互，用文件工具增量更新战役档案。档案文件及用途：',
+    ...MEMORY_FILE_SPEC,
+    MEMORY_RULES,
+    AGENT_TOOL_GUIDE,
+  ].join('\n');
+  const prompt = `<current_files>\n${currentFilesBlock(campaign)}\n</current_files>\n\n${memoryExchangeBlock(lastUserText, replyText, notes, replyNo)}`;
+  const { usage, rounds } = await runMemoryAgent(campaign, system, prompt);
+  const tag = trackUsage('memory', campaign, usage);
+  console.log(`[memory] ${campaign.id} 更新完成 (agent, ${((Date.now() - startedAt) / 1000).toFixed(1)}s, ${rounds} rounds)${tag}`);
+}
+
 // 本轮交互未能记账（任务失败/被跳过）时，降级为修正说明挂账：下一次更新的
 // <corrections> 块里带轮号和节选要求补记，sdk 模式的 agent 还能按轮号自行
 // Read transcript.jsonl 核对全文。挂账上限防连续失败时膨胀。
@@ -790,7 +994,9 @@ async function updateMemory(campaign, lastUserText, replyText) {
   // 让旧轮号漂移，属可接受误差——轮号指针是尽力而为的导航，不是强一致索引。
   const replyNo = campaign.transcript.length;
   try {
-    if (memoryModeNow() === 'api') await updateMemoryApi(campaign, lastUserText, replyText, notes, startedAt, replyNo);
+    const mode = memoryModeNow();
+    if (mode === 'api') await updateMemoryApi(campaign, lastUserText, replyText, notes, startedAt, replyNo);
+    else if (mode === 'agent') await updateMemoryAgent(campaign, lastUserText, replyText, notes, startedAt, replyNo);
     else await updateMemorySdk(campaign, lastUserText, replyText, notes, startedAt, replyNo);
     saveCampaign(campaign); // 持久化 meta 里的用量累计
   } catch (e) {
@@ -826,6 +1032,7 @@ async function catchupBatchSdk(campaign, from, to) {
     '',
     catchupBlock(campaign, from, to),
   ].join('\n');
+  const { query } = await loadSdk();
   let tag = '';
   for await (const msg of query({
     prompt,
@@ -847,12 +1054,20 @@ async function catchupBatchSdk(campaign, from, to) {
   return tag;
 }
 
+async function catchupBatchAgent(campaign, from, to) {
+  const system = [
+    '你是战役记忆管理器。这是一次"补课"：战役对话原文已完整归档，但档案尚未覆盖这批早期轮次。请通读原文，用文件工具把其中的叙事事实补入战役档案。档案文件及用途：',
+    ...MEMORY_FILE_SPEC,
+    CATCHUP_RULES,
+    AGENT_TOOL_GUIDE,
+  ].join('\n');
+  const prompt = `<current_files>\n${currentFilesBlock(campaign)}\n</current_files>\n\n${catchupBlock(campaign, from, to)}`;
+  const { usage, rounds } = await runMemoryAgent(campaign, system, prompt);
+  return trackUsage('memory', campaign, usage) + ` (${rounds} rounds)`;
+}
+
 async function catchupBatchApi(campaign, from, to) {
-  const current = MEMORY_MD_FILES.map(f => {
-    const p = path.join(campaign.dir, f);
-    const text = fs.existsSync(p) ? fs.readFileSync(p, 'utf8').slice(0, 12000) : '（尚不存在）';
-    return `===FILE: ${f}===\n${text}`;
-  }).join('\n\n');
+  const current = currentFilesBlock(campaign);
   const system = [
     '你是战役记忆管理器。这是一次"补课"：战役对话原文已完整归档，但档案尚未覆盖这批早期轮次。档案文件及用途：',
     ...MEMORY_FILE_SPEC,
@@ -888,9 +1103,10 @@ async function runCatchup(campaign) {
       backupMemoryFiles(campaign, 'catchup');
       const startedAt = Date.now();
       try {
-        const tag = memoryModeNow() === 'api'
-          ? await catchupBatchApi(campaign, from, to)
-          : await catchupBatchSdk(campaign, from, to);
+        const mode = memoryModeNow();
+        const tag = mode === 'api' ? await catchupBatchApi(campaign, from, to)
+          : mode === 'agent' ? await catchupBatchAgent(campaign, from, to)
+            : await catchupBatchSdk(campaign, from, to);
         console.log(`[memory] ${campaign.id} 补课 #${from + 1}-#${to} 完成 (${((Date.now() - startedAt) / 1000).toFixed(1)}s)${tag}`);
       } finally {
         campaign.memoryJobRunning = false;
@@ -921,6 +1137,7 @@ async function completeText(system, prompt) {
   if (CFG.RECALL_MODE === 'api') {
     return openaiChat({ url: CFG.RECALL_API_URL, key: CFG.RECALL_API_KEY, model: CFG.RECALL_API_MODEL }, system, prompt);
   }
+  const { query } = await loadSdk();
   let text = '';
   let usage = null;
   for await (const msg of query({
@@ -1153,27 +1370,34 @@ function rollFormula(formula) {
   return { total, text: `${n}d${faces}${modText} = [${rolls.join(', ')}]${modText} = ${total}` };
 }
 
-const diceServer = createSdkMcpServer({
-  name: 'dice',
-  version: '1.0.0',
-  tools: [
-    tool(
-      'roll',
-      '真随机掷骰。仅在剧情确实需要骰点（属性/技能检定、攻击、伤害、先攻、随机表等）时调用，formula 形如 1d20+5、2d6、d100。必须以返回的结果为准叙述成败，不得自行虚构点数。',
-      { formula: z.string().describe('骰式，NdM+K 格式') },
-      async ({ formula }) => {
-        try {
-          const r = rollFormula(formula);
-          diceRollCount++;
-          console.log(`[dice] ${r.text}`);
-          return { content: [{ type: 'text', text: r.text }] };
-        } catch (e) {
-          return { content: [{ type: 'text', text: e.message }], isError: true };
-        }
-      },
-    ),
-  ],
-});
+// 骰子 MCP 服务器懒构建（依赖 Agent SDK，仅 sdk 通道的 tool 模式用到）
+let _diceServer = null;
+async function getDiceServer() {
+  if (_diceServer) return _diceServer;
+  const { tool, createSdkMcpServer } = await loadSdk();
+  _diceServer = createSdkMcpServer({
+    name: 'dice',
+    version: '1.0.0',
+    tools: [
+      tool(
+        'roll',
+        '真随机掷骰。仅在剧情确实需要骰点（属性/技能检定、攻击、伤害、先攻、随机表等）时调用，formula 形如 1d20+5、2d6、d100。必须以返回的结果为准叙述成败，不得自行虚构点数。',
+        { formula: z.string().describe('骰式，NdM+K 格式') },
+        async ({ formula }) => {
+          try {
+            const r = rollFormula(formula);
+            diceRollCount++;
+            console.log(`[dice] ${r.text}`);
+            return { content: [{ type: 'text', text: r.text }] };
+          } catch (e) {
+            return { content: [{ type: 'text', text: e.message }], isError: true };
+          }
+        },
+      ),
+    ],
+  });
+  return _diceServer;
+}
 
 const DICE_TOOL_HINT = '\n\n<dice_tool>\n已接入真随机掷骰工具 roll（骰式如 1d20+5、2d20）。硬性规则：回复中出现的一切骰点数字——包括任何战斗/检定模板里的"掷骰"字段、优势/劣势取值、命中骰、伤害骰、随机表——都必须来自 roll 工具的真实返回值。先调用工具拿到点数，再据其撰写结算与叙事；严禁凭空编写任何点数，哪怕格式模板要求填写。一次需要多个点数时，在同一条消息里并行发出多个 roll 调用（优势/劣势 = roll("2d20") 后取高/取低）。纯对话与无检定的叙事场合不要调用。\n</dice_tool>';
 
@@ -1254,17 +1478,18 @@ function buildPrompt(body) {
   // 缓存友好排布：md 档案等每轮易变的内容后置到正文之后，让 system（预设）
   // 与 transcript 的长前缀保持逐字稳定——md 变化只作废末尾一小段缓存。
   const systemPrompt = systemParts.join('\n\n');
-  const prompt = [
-    dropped > 0 ? `（更早的 ${dropped} 条对话已归档进战役记忆，见下方 campaign_memory）` : '',
-    '<transcript>', transcriptText, '</transcript>',
-    campaign ? readMemory(campaign) : '',
-  ].filter(Boolean).join('\n');
+  const droppedNote = dropped > 0 ? `（更早的 ${dropped} 条对话已归档进战役记忆，见下方 campaign_memory）` : '';
+  const memoryText = campaign ? readMemory(campaign) : '';
+  const prompt = [droppedNote, '<transcript>', transcriptText, '</transcript>', memoryText]
+    .filter(Boolean).join('\n');
 
-  return { campaign, systemPrompt, prompt, lastUserText };
+  // recent/droppedNote/memoryText 供 api 通道组装原生 messages 数组（sdk 通道用拼好的 prompt）
+  return { campaign, systemPrompt, prompt, recent, droppedNote, memoryText, lastUserText };
 }
 
 // ---------- SDK 调用 ----------
 async function* generate(model, systemPrompt, prompt, cwd, usageOut = {}, withDice = false) {
+  const { query } = await loadSdk();
   const q = query({
     prompt,
     options: {
@@ -1276,7 +1501,7 @@ async function* generate(model, systemPrompt, prompt, cwd, usageOut = {}, withDi
       ...(CFG.CHAT_EFFORT ? { effort: CFG.CHAT_EFFORT } : {}),
       // 掷骰工具启用时放开工具循环，其余场合保持纯单轮生成
       ...(withDice
-        ? { mcpServers: { dice: diceServer }, allowedTools: ['mcp__dice__roll'], maxTurns: CFG.DICE_MAX_TURNS }
+        ? { mcpServers: { dice: await getDiceServer() }, allowedTools: ['mcp__dice__roll'], maxTurns: CFG.DICE_MAX_TURNS }
         : { allowedTools: [], maxTurns: 1 }),
     },
   });
@@ -1310,8 +1535,17 @@ function toOpenaiUsage(rawUsage) {
   return { prompt_tokens: prompt, completion_tokens: n.output, total_tokens: prompt + n.output };
 }
 
+// 转发 ST 请求里的常用生成参数（api 通道用；SDK 通道由 Claude Code 自管）
+function pickGenParams(body) {
+  const out = {};
+  for (const k of ['temperature', 'top_p', 'frequency_penalty', 'presence_penalty', 'max_tokens', 'reasoning_effort']) {
+    if (body[k] !== undefined && body[k] !== null) out[k] = body[k];
+  }
+  return out;
+}
+
 async function handleChat(req, res, body) {
-  const { campaign, systemPrompt: baseSystem, prompt, lastUserText } = buildPrompt(body);
+  const { campaign, systemPrompt: baseSystem, prompt, recent, droppedNote, memoryText, lastUserText } = buildPrompt(body);
   let systemPrompt = baseSystem;
   let promptTail = ''; // 回溯/骰池等每轮易变的注入统一后置，保住前缀缓存
   if (recallModeNow() !== 'off' && campaign && lastUserText
@@ -1324,19 +1558,24 @@ async function handleChat(req, res, body) {
   }
   const id = 'chatcmpl-' + Math.random().toString(36).slice(2);
   const stream = body.stream !== false;
-  const model = MODELS.includes(body.model) ? body.model : CFG.BRIDGE_MODEL;
+  const chatApi = chatModeNow() === 'api';
+  const model = chatApi
+    ? (CFG.CHAT_API_MODEL || body.model || 'api-model')
+    : (MODELS.includes(body.model) ? body.model : CFG.BRIDGE_MODEL);
   const cwd = campaign ? campaign.dir : MEMORY_ROOT;
   const usageOut = {};
   let full = '';
 
-  // 掷骰：按 system（预设+卡+世界书）中的规则关键词决定是否启用，非跑团场景零介入
+  // 掷骰：按 system（预设+卡+世界书）中的规则关键词决定是否启用，非跑团场景零介入。
+  // api 通道暂不支持工具掷骰（MCP 是 SDK 专属），tool 配置自动降级为熵池。
   let withDice = false;
   const diceCallsBefore = diceRollCount;
   const armed = diceArmed(baseSystem);
-  if (armed && CFG.DICE_MODE === 'tool') {
+  if (armed && CFG.DICE_MODE === 'tool' && !chatApi) {
     systemPrompt += DICE_TOOL_HINT;
     withDice = true;
-  } else if (armed && CFG.DICE_MODE === 'pool') {
+  } else if (armed && (CFG.DICE_MODE === 'pool' || (CFG.DICE_MODE === 'tool' && chatApi))) {
+    if (CFG.DICE_MODE === 'tool') console.log('[dice] api 通道不支持工具掷骰，本轮降级为熵池注入');
     const { pool, block } = buildDicePool();
     promptTail += block;
     console.log(`[dice] 熵池注入:\n${pool.split('\n').map(l => '        ' + l).join('\n')}`);
@@ -1348,6 +1587,27 @@ async function handleChat(req, res, body) {
     else if (wasArmed) console.log(`[dice] ${campaign.id} 规则关键词消失，掷骰已停用`);
   }
   const finalPrompt = prompt + promptTail + '\n\n' + CFG.CONTINUE_PROMPT;
+
+  // api 通道：把窗口内轮次还原成原生 messages（GPT/Grok 的标准形态），
+  // 归档说明/md 档案/回溯/骰池/续写指令合并进最后的 user 消息（保持"易变内容后置"）
+  let apiPayload = null;
+  if (chatApi) {
+    const tailContent = [droppedNote, memoryText, promptTail].filter(Boolean).join('\n')
+      + (droppedNote || memoryText || promptTail ? '\n\n' : '') + CFG.CONTINUE_PROMPT;
+    const native = recent.map(t => ({ role: t.role === 'assistant' ? 'assistant' : 'user', content: t.content }));
+    if (native.length && native[native.length - 1].role === 'user') {
+      native[native.length - 1] = { role: 'user', content: native[native.length - 1].content + '\n\n' + tailContent };
+    } else {
+      native.push({ role: 'user', content: tailContent });
+    }
+    apiPayload = {
+      model,
+      messages: [{ role: 'system', content: systemPrompt }, ...native],
+      ...pickGenParams(body),
+    };
+  }
+  const apiCfg = { url: CFG.CHAT_API_URL, key: CFG.CHAT_API_KEY };
+
   try {
     if (stream) {
       res.writeHead(200, {
@@ -1356,15 +1616,29 @@ async function handleChat(req, res, body) {
         'Connection': 'keep-alive',
       });
       res.write(sseChunk(id, model, { role: 'assistant', content: '' }));
-      for await (const text of generate(model, systemPrompt, finalPrompt, cwd, usageOut, withDice)) {
-        full += text;
-        res.write(sseChunk(id, model, { content: text }));
+      if (chatApi) {
+        const r = await openaiChatStream(apiCfg, apiPayload, (text) => {
+          full += text;
+          res.write(sseChunk(id, model, { content: text }));
+        });
+        usageOut.usage = r.usage;
+      } else {
+        for await (const text of generate(model, systemPrompt, finalPrompt, cwd, usageOut, withDice)) {
+          full += text;
+          res.write(sseChunk(id, model, { content: text }));
+        }
       }
       res.write(sseChunk(id, model, {}, 'stop', toOpenaiUsage(usageOut.usage)));
       res.write('data: [DONE]\n\n');
       res.end();
     } else {
-      for await (const text of generate(model, systemPrompt, finalPrompt, cwd, usageOut, withDice)) full += text;
+      if (chatApi) {
+        const r = await openaiRaw(apiCfg, { ...apiPayload, stream: false });
+        full = r.choices?.[0]?.message?.content || '';
+        usageOut.usage = r.usage || null;
+      } else {
+        for await (const text of generate(model, systemPrompt, finalPrompt, cwd, usageOut, withDice)) full += text;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         id, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
@@ -1518,7 +1792,8 @@ loadCampaigns();
 server.listen(PORT, '127.0.0.1', () => {
   const recallDesc = CFG.RECALL_MODE === 'off' ? 'off'
     : CFG.RECALL_MODE === 'api' ? `api(${CFG.RECALL_API_MODEL})` : `sdk(${CFG.RECALL_MODEL})`;
-  const memoryDesc = CFG.MEMORY_MODE === 'api' ? `api(${CFG.MEMORY_API_MODEL})` : `sdk(${CFG.MEMORY_MODEL || CFG.BRIDGE_MODEL})`;
+  const chatDesc = CFG.CHAT_MODE === 'api' ? `api(${CFG.CHAT_API_MODEL || '跟随请求'})` : `sdk(${CFG.BRIDGE_MODEL})`;
+  const memoryDesc = CFG.MEMORY_MODE === 'sdk' ? `sdk(${CFG.MEMORY_MODEL || CFG.BRIDGE_MODEL})` : `${CFG.MEMORY_MODE}(${CFG.MEMORY_API_MODEL})`;
   const diceDesc = CFG.DICE_MODE === 'off' ? 'off' : `${CFG.DICE_MODE}/${CFG.DICE_TRIGGER}`;
-  console.log(`st-claude-bridge listening on http://127.0.0.1:${PORT}/v1  (default: ${CFG.BRIDGE_MODEL}, memory: ${memoryDesc}, recall: ${recallDesc}, dice: ${diceDesc}, campaigns: ${campaigns.size}, root: ${MEMORY_ROOT}, admin: ws://127.0.0.1:${PORT}/admin)`);
+  console.log(`st-claude-bridge listening on http://127.0.0.1:${PORT}/v1  (chat: ${chatDesc}, memory: ${memoryDesc}, recall: ${recallDesc}, dice: ${diceDesc}, campaigns: ${campaigns.size}, root: ${MEMORY_ROOT}, admin: ws://127.0.0.1:${PORT}/admin)`);
 });
