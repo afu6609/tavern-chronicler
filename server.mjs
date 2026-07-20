@@ -661,59 +661,158 @@ function readMemory(campaign) {
 }
 
 // ---------- OpenAI 兼容上游调用 ----------
-// openaiRaw：任意 payload 的 POST /chat/completions（记忆 agent 循环、api 出词共用）
-async function openaiRaw({ url, key }, payload) {
-  const r = await fetch(`${url}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      ...(key ? { authorization: `Bearer ${key}` } : {}),
-    },
-    body: JSON.stringify(payload),
-  });
-  if (!r.ok) {
-    const detail = (await r.text().catch(() => '')).slice(0, 300);
-    throw new Error(`api HTTP ${r.status}${detail ? `：${detail}` : ''}`);
-  }
-  return r.json();
+const API_TIMEOUT_MS = 600_000;      // 非流式单发总时长（记忆 agent 高推理档一轮可能数分钟）
+const API_IDLE_TIMEOUT_MS = 300_000; // 流式：连续这么久无任何数据块视为死流
+
+// 带状态码的上游错误，供下游映射成合适的响应码（429 透传、其余 4xx/5xx → 502）
+function httpError(status, detail) {
+  const err = new Error(`api HTTP ${status}${detail ? `：${String(detail).slice(0, 300)}` : ''}`);
+  err.status = status;
+  return err;
 }
 
-// 流式补全：解析上游 SSE，逐段回调 onDelta，返回全文与 usage（末块携带，
-// 需上游支持 stream_options.include_usage；不带就返回 null，用量记不上但不影响出字）
-async function openaiChatStream({ url, key }, payload, onDelta) {
-  const r = await fetch(`${url}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      ...(key ? { authorization: `Bearer ${key}` } : {}),
-    },
-    body: JSON.stringify({ ...payload, stream: true, stream_options: { include_usage: true } }),
-  });
-  if (!r.ok) {
-    const detail = (await r.text().catch(() => '')).slice(0, 300);
-    throw new Error(`api HTTP ${r.status}${detail ? `：${detail}` : ''}`);
+// content 可能是 string 或多模态数组，统一取纯文本
+function contentText(c) {
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.map(p => (typeof p === 'string' ? p : p?.text || '')).join('');
+  return '';
+}
+
+// 超时 + 外部取消（客户端断开）合成一个 AbortSignal；reset() 用于流式空闲计时
+function apiAbort(timeoutMs, external, label) {
+  const ac = new AbortController();
+  const fire = () => ac.abort(Object.assign(new Error(label), { status: 504 }));
+  let timer = setTimeout(fire, timeoutMs);
+  const onExt = () => ac.abort(new Error('客户端已断开，上游请求取消'));
+  external?.addEventListener('abort', onExt, { once: true });
+  return {
+    signal: ac.signal,
+    reset: () => { clearTimeout(timer); timer = setTimeout(fire, timeoutMs); },
+    done: () => { clearTimeout(timer); external?.removeEventListener('abort', onExt); },
+  };
+}
+const abortReason = (signal) =>
+  (signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason || '请求被取消')));
+
+// openaiRaw：任意 payload 的 POST /chat/completions（记忆 agent 循环、api 出词共用）
+async function openaiRaw({ url, key }, payload, { signal = null } = {}) {
+  const ab = apiAbort(API_TIMEOUT_MS, signal, `上游 ${API_TIMEOUT_MS / 1000}s 无响应`);
+  try {
+    const r = await fetch(`${url}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(key ? { authorization: `Bearer ${key}` } : {}),
+      },
+      body: JSON.stringify(payload),
+      signal: ab.signal,
+    });
+    if (!r.ok) throw httpError(r.status, await r.text().catch(() => ''));
+    return await r.json();
+  } catch (e) {
+    throw ab.signal.aborted ? abortReason(ab.signal) : e;
+  } finally {
+    ab.done();
   }
-  let text = '';
-  let usage = null;
-  let buf = '';
-  const decoder = new TextDecoder();
-  for await (const chunk of r.body) {
-    buf += decoder.decode(chunk, { stream: true });
-    let nl;
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl).trim();
-      buf = buf.slice(nl + 1);
-      if (!line.startsWith('data:')) continue;
-      const data = line.slice(5).trim();
-      if (!data || data === '[DONE]') continue;
-      let j;
-      try { j = JSON.parse(data); } catch { continue; }
-      if (j.usage) usage = j.usage;
-      const delta = j.choices?.[0]?.delta?.content;
-      if (delta) { text += delta; onDelta(delta); }
+}
+
+// 流式补全：按 SSE 事件边界解析（多行 data:、CRLF、EOF 尾行无换行都能处理），逐段
+// 回调 onDelta，返回 { text, usage, finish }。容错反代常见变体：200 但回 JSON 错误体/
+// 整段 completion、不支持 stream_options（自动降级重试）、发完 [DONE] 不断连（主动收工）、
+// reasoning 增量（只算活跃度不透传）。onOpen 在确认上游可读后才触发，调用方此时再向
+// 下游发 200，避免上游一开始就报错时只能回半截空 SSE。
+async function openaiChatStream({ url, key }, payload, onDelta, { onOpen = null, signal = null } = {}) {
+  const ab = apiAbort(API_IDLE_TIMEOUT_MS, signal, `上游流 ${API_IDLE_TIMEOUT_MS / 1000}s 无数据`);
+  try {
+    const doFetch = (withUsage) => fetch(`${url}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(key ? { authorization: `Bearer ${key}` } : {}),
+      },
+      body: JSON.stringify(withUsage
+        ? { ...payload, stream: true, stream_options: { include_usage: true } }
+        : { ...payload, stream: true }),
+      signal: ab.signal,
+    });
+    let r = await doFetch(true);
+    if (r.status === 400) {
+      const detail = await r.text().catch(() => '');
+      if (!/stream_options/i.test(detail)) throw httpError(400, detail);
+      console.warn('[chat] 上游不支持 stream_options，已降级重试（本轮用量可能记不上）');
+      r = await doFetch(false);
     }
+    if (!r.ok) throw httpError(r.status, await r.text().catch(() => ''));
+
+    const ctype = r.headers.get('content-type') || '';
+    if (!ctype.includes('text/event-stream')) {
+      // 声明了 stream 却回整段 JSON：可能是错误对象，也可能是无视 stream 的普通 completion
+      const raw = await r.text();
+      let j = null;
+      try { j = JSON.parse(raw); } catch { /* 非 JSON 走下面的兜底报错 */ }
+      if (j?.error) throw new Error(`上游错误：${String(j.error.message || JSON.stringify(j.error)).slice(0, 300)}`);
+      if (!j?.choices) throw new Error(`上游返回了非 SSE 响应（${ctype || '无 content-type'}）：${raw.slice(0, 200)}`);
+      const whole = contentText(j.choices[0]?.message?.content);
+      onOpen?.();
+      if (whole) onDelta(whole);
+      return { text: whole, usage: j.usage || null, finish: j.choices[0]?.finish_reason || 'stop' };
+    }
+
+    onOpen?.();
+    let text = '';
+    let usage = null;
+    let finish = null;
+    let sawDone = false;
+    let sawReasoning = false;
+    let evErr = null;
+    const handleEvent = (data) => {
+      if (data === '[DONE]') { sawDone = true; return; }
+      let j;
+      try { j = JSON.parse(data); } catch { return; }
+      if (j.error) {
+        evErr = new Error(`上游流内错误：${String(j.error.message || JSON.stringify(j.error)).slice(0, 300)}`);
+        sawDone = true;
+        return;
+      }
+      if (j.usage) usage = j.usage;
+      const ch = j.choices?.[0];
+      if (ch?.finish_reason) finish = ch.finish_reason;
+      const d = ch?.delta || {};
+      if (d.reasoning_content || d.reasoning || d.thinking) sawReasoning = true;
+      const piece = contentText(d.content);
+      if (piece) { text += piece; onDelta(piece); }
+    };
+    let buf = '';
+    let evData = [];
+    const feed = (s) => {
+      buf += s;
+      let nl;
+      while (!sawDone && (nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).replace(/\r$/, '');
+        buf = buf.slice(nl + 1);
+        if (line === '') {
+          if (evData.length) { handleEvent(evData.join('\n')); evData = []; }
+        } else if (line.startsWith('data:')) {
+          evData.push(line.slice(5).replace(/^ /, ''));
+        } // 其余字段（event:/id:/注释心跳）忽略
+      }
+    };
+    const decoder = new TextDecoder();
+    for await (const chunk of r.body) {
+      ab.reset(); // 任何数据（含 reasoning 增量、心跳）都算活着
+      feed(decoder.decode(chunk, { stream: true }));
+      if (sawDone) break; // 收到 [DONE] 或错误事件即收工，不陪发完不断连的反代干等
+    }
+    if (!sawDone) feed(decoder.decode() + '\n\n'); // EOF：冲洗解码器、补处理无换行尾行与未派发事件
+    if (evErr) throw evErr;
+    if (!text && sawReasoning) throw new Error('上游只返回了思维增量、未产出正文（反代可能未透传正文字段）');
+    if (!text && !sawDone && !finish) throw new Error('上游流异常结束：未收到任何内容或终止标记');
+    return { text, usage, finish: finish || 'stop' };
+  } catch (e) {
+    throw ab.signal.aborted ? abortReason(ab.signal) : e;
+  } finally {
+    ab.done();
   }
-  return { text, usage };
 }
 
 // 通用单轮补全（记忆 api 模式与回溯 api 模式共用）
@@ -723,7 +822,7 @@ async function openaiChat({ url, key, model }, system, prompt) {
     stream: false,
     messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }],
   });
-  return { text: j.choices?.[0]?.message?.content || '', usage: j.usage || null };
+  return { text: contentText(j.choices?.[0]?.message?.content), usage: j.usage || null };
 }
 
 const MEMORY_FILE_SPEC = [
@@ -883,9 +982,11 @@ function agentToolExec(campaign, name, args) {
   if (name === 'write_file') {
     const f = String(args.name || '');
     if (!MEMORY_MD_FILES.includes(f)) return `错误：${f} 不在档案白名单，禁止写入`;
+    // 缺 content 直接拒绝：不规范上游漏传参数时不能把档案清成空文件
+    if (typeof args.content !== 'string' || !args.content) return '错误：write_file 缺少 content（整体重写必须给出完整新内容）';
     fs.mkdirSync(campaign.dir, { recursive: true });
-    fs.writeFileSync(path.join(campaign.dir, f), String(args.content ?? ''));
-    return `已写入 ${f}（${Buffer.byteLength(String(args.content ?? ''))} 字节）`;
+    fs.writeFileSync(path.join(campaign.dir, f), args.content);
+    return `已写入 ${f}（${Buffer.byteLength(args.content)} 字节）`;
   }
   if (name === 'edit_file') {
     const f = String(args.name || '');
@@ -895,7 +996,9 @@ function agentToolExec(campaign, name, args) {
     const text = fs.readFileSync(p, 'utf8');
     const old = String(args.old_string ?? '');
     if (!old || !text.includes(old)) return '错误：old_string 未在文件中找到（须与现文逐字一致）';
-    fs.writeFileSync(p, text.replace(old, String(args.new_string ?? '')));
+    // 漏传 new_string 时不能默默当成删除；要删须显式传空字符串
+    if (typeof args.new_string !== 'string') return '错误：edit_file 缺少 new_string（删除内容请显式传空字符串）';
+    fs.writeFileSync(p, text.replace(old, args.new_string));
     return `已替换 ${f} 中的一处内容`;
   }
   if (name === 'search_transcript') {
@@ -929,6 +1032,8 @@ async function runMemoryAgent(campaign, system, userContent) {
     messages.push(msg);
     const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
     if (!calls.length) {
+      // 没调工具但是被 token 上限截断的，不能当"正常收尾"接受
+      if (r.choices?.[0]?.finish_reason === 'length') throw new Error('agent 响应被截断（finish_reason=length）');
       return {
         rounds: round,
         usage: { prompt_tokens: total.prompt, completion_tokens: total.completion,
@@ -937,8 +1042,13 @@ async function runMemoryAgent(campaign, system, userContent) {
     }
     for (const call of calls) {
       let result;
-      try { result = agentToolExec(campaign, call.function?.name, JSON.parse(call.function?.arguments || '{}')); }
-      catch (e) { result = `错误：${e.message}`; }
+      try {
+        // 有些兼容端点把 arguments 直接给成对象而非 JSON 字符串
+        const rawArgs = call.function?.arguments;
+        const args = typeof rawArgs === 'string' ? JSON.parse(rawArgs || '{}')
+          : (rawArgs && typeof rawArgs === 'object' ? rawArgs : {});
+        result = agentToolExec(campaign, call.function?.name, args);
+      } catch (e) { result = `错误：${e.message}`; }
       messages.push({ role: 'tool', tool_call_id: call.id, content: String(result) });
     }
   }
@@ -1538,9 +1648,12 @@ function toOpenaiUsage(rawUsage) {
 // 转发 ST 请求里的常用生成参数（api 通道用；SDK 通道由 Claude Code 自管）
 function pickGenParams(body) {
   const out = {};
-  for (const k of ['temperature', 'top_p', 'frequency_penalty', 'presence_penalty', 'max_tokens', 'reasoning_effort']) {
+  for (const k of ['temperature', 'top_p', 'frequency_penalty', 'presence_penalty',
+    'max_tokens', 'max_completion_tokens', 'reasoning_effort', 'stop']) {
     if (body[k] !== undefined && body[k] !== null) out[k] = body[k];
   }
+  // 两种 token 上限并存时只发新式的，部分端点会拒绝同时出现
+  if (out.max_tokens !== undefined && out.max_completion_tokens !== undefined) delete out.max_tokens;
   return out;
 }
 
@@ -1607,34 +1720,44 @@ async function handleChat(req, res, body) {
     };
   }
   const apiCfg = { url: CFG.CHAT_API_URL, key: CFG.CHAT_API_KEY };
+  // 客户端断开（ST 停止生成/关页）时取消上游 fetch，省 token 也防悬挂
+  const clientGone = new AbortController();
+  if (chatApi) res.once('close', () => { if (!res.writableEnded) clientGone.abort(); });
 
+  let finishOut = 'stop';
+  const openSse = () => {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+    res.write(sseChunk(id, model, { role: 'assistant', content: '' }));
+  };
   try {
     if (stream) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-      });
-      res.write(sseChunk(id, model, { role: 'assistant', content: '' }));
       if (chatApi) {
+        // onOpen：确认上游可读后才向 ST 发 200，上游一上来就报错时能回真实错误码
         const r = await openaiChatStream(apiCfg, apiPayload, (text) => {
           full += text;
           res.write(sseChunk(id, model, { content: text }));
-        });
+        }, { onOpen: openSse, signal: clientGone.signal });
         usageOut.usage = r.usage;
+        finishOut = r.finish;
       } else {
+        openSse();
         for await (const text of generate(model, systemPrompt, finalPrompt, cwd, usageOut, withDice)) {
           full += text;
           res.write(sseChunk(id, model, { content: text }));
         }
       }
-      res.write(sseChunk(id, model, {}, 'stop', toOpenaiUsage(usageOut.usage)));
+      res.write(sseChunk(id, model, {}, finishOut, toOpenaiUsage(usageOut.usage)));
       res.write('data: [DONE]\n\n');
       res.end();
     } else {
       if (chatApi) {
-        const r = await openaiRaw(apiCfg, { ...apiPayload, stream: false });
-        full = r.choices?.[0]?.message?.content || '';
+        const r = await openaiRaw(apiCfg, { ...apiPayload, stream: false }, { signal: clientGone.signal });
+        full = contentText(r.choices?.[0]?.message?.content);
+        finishOut = r.choices?.[0]?.finish_reason || 'stop';
         usageOut.usage = r.usage || null;
       } else {
         for await (const text of generate(model, systemPrompt, finalPrompt, cwd, usageOut, withDice)) full += text;
@@ -1642,10 +1765,11 @@ async function handleChat(req, res, body) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         id, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
-        choices: [{ index: 0, message: { role: 'assistant', content: full }, finish_reason: 'stop' }],
+        choices: [{ index: 0, message: { role: 'assistant', content: full }, finish_reason: finishOut }],
         usage: toOpenaiUsage(usageOut.usage),
       }));
     }
+    if (finishOut !== 'stop') console.warn(`[chat] ⚠ 上游终止原因异常: ${finishOut}（length=被 token 上限截断，content_filter=被内容过滤）`);
     const tag = trackUsage('chat', campaign, usageOut.usage);
     console.log(`[chat] 回复 ${full.length} 字符 (${model}${campaign ? ', ' + campaign.id : ''})${tag}`);
     // 骰点对账：挂了工具却零调用、正文里又出现骰点描述 → 点数是模型编的
@@ -1662,9 +1786,16 @@ async function handleChat(req, res, body) {
   } catch (e) {
     console.error('[chat] 失败:', e.message);
     if (!res.headersSent) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
+      // 上游 429 透传（ST 可据此退避），超时 504，其余上游错误 502，桥内部错误 500
+      const status = e.status === 429 ? 429 : e.status === 504 ? 504 : e.status ? 502 : 500;
+      res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: e.message, type: 'bridge_error' } }));
-    } else {
+    } else if (!res.writableEnded) {
+      // 已在流中：补一个结构化错误事件再收尾，别让 ST 只见半截静默 SSE
+      if (stream) {
+        res.write(`data: ${JSON.stringify({ error: { message: e.message, type: 'bridge_error' } })}\n\n`);
+        res.write('data: [DONE]\n\n');
+      }
       res.end();
     }
   }
@@ -1700,13 +1831,37 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === 'POST' && (url === '/v1/chat/completions' || url === '/chat/completions')) {
     let raw = '';
-    req.on('data', c => { raw += c; });
+    let tooBig = false;
+    req.on('error', () => {}); // 客户端上传中途断开时别抛未处理异常
+    req.on('data', c => {
+      if (tooBig) return;
+      raw += c;
+      if (raw.length > 64 * 1024 * 1024) {
+        tooBig = true;
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'request body too large (>64MiB)' } }));
+        req.destroy();
+      }
+    });
     req.on('end', () => {
-      try { handleChat(req, res, JSON.parse(raw)); }
+      if (tooBig) return;
+      let body;
+      try { body = JSON.parse(raw); }
       catch (e) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: 'bad json: ' + e.message } }));
+        return;
       }
+      // handleChat 自带 try/catch；这里兜底 buildPrompt 等前段的异常，别让请求悬空
+      handleChat(req, res, body).catch(e => {
+        console.error('[chat] 未捕获异常:', e);
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: e.message, type: 'bridge_error' } }));
+        } else if (!res.writableEnded) {
+          res.end();
+        }
+      });
     });
     return;
   }
