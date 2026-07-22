@@ -1,8 +1,9 @@
-// st-claude-bridge — SillyTavern ↔ LLM 代理（双通道）
-// ST 把这里当 OpenAI 兼容后端连。回复通道二选一（CHAT_MODE）：
-//   sdk = Claude Agent SDK（走 Claude Code 订阅登录态，零 API 费用）
-//   api = 任意 OpenAI 兼容端点（GPT/Grok 等，自备 key）——无 Claude 订阅也能用全套记忆系统
-// 每次回复完成后，后台记忆任务异步更新对应战役目录下的 Markdown 档案（sdk/agent/api 三种后端）。
+// st-claude-bridge — SillyTavern ↔ LLM 代理（三通道）
+// ST 把这里当 OpenAI 兼容后端连。回复通道（CHAT_MODE）：
+//   claude-code = Claude Agent SDK（走 Claude Code 订阅登录态）
+//   codex       = 官方 Codex SDK（走 ChatGPT/Codex 订阅登录态）
+//   api         = 任意 OpenAI 兼容端点（GPT/Grok 等，自备 key）
+// 每次回复完成后，后台任务按所选后端维护对应战役目录下的 Markdown 档案。
 // 战役识别：聊天键（ST 扩展随请求盖章）优先，对话指纹（各轮内容哈希重合度）回退。
 import http from 'node:http';
 import fs from 'node:fs';
@@ -11,19 +12,22 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { WebSocketServer } from 'ws';
+import { buildDiceMcpServers, runCodex } from './codex-runner.mjs';
+import { DICE_TOOL_DESCRIPTION, rollFormula } from './dice.mjs';
 
-// Agent SDK 按需加载：只有 sdk 通道用到；纯 api 部署可以不装它
+// Claude Agent SDK 按需加载：只有 claude-code 通道用到；纯 codex/api 部署可以不装它
 // （package.json 里列为 optionalDependencies，安装失败不影响启动）。
-let _sdk = null;
-async function loadSdk() {
-  if (!_sdk) {
-    try { _sdk = await import('@anthropic-ai/claude-agent-sdk'); }
-    catch { throw new Error('未安装 @anthropic-ai/claude-agent-sdk，无法使用 sdk 通道；请改用 api/agent 模式，或 npm install 补装'); }
+let _claudeCode = null;
+async function loadClaudeCode() {
+  if (!_claudeCode) {
+    try { _claudeCode = await import('@anthropic-ai/claude-agent-sdk'); }
+    catch { throw new Error('未安装 @anthropic-ai/claude-agent-sdk，无法使用 claude-code 通道；请改用 codex/api/agent 模式，或 npm install 补装'); }
   }
-  return _sdk;
+  return _claudeCode;
 }
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const DICE_MCP_SERVER = path.join(ROOT, 'dice-mcp-server.mjs');
 const PORT = Number(process.env.PORT || 9377);
 const MEMORY_ROOT = process.env.MEMORY_ROOT || path.join(ROOT, 'memory');
 const CAMPAIGNS_ROOT = path.join(MEMORY_ROOT, 'campaigns');
@@ -72,6 +76,15 @@ const MODELS = [
   'claude-sonnet-4-5[1m]',
   'claude-sonnet-4-0',
 ];
+// Codex 官方推荐模型。实际可见性取决于 ChatGPT 套餐/工作区策略；额外模型可在
+// CODEX_EXTRA_MODELS 中热添加，不必等桥更新。
+const CODEX_MODELS = [
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'gpt-5.5',
+  'gpt-5.3-codex-spark',
+];
 // ---------- 运行时配置 ----------
 // 优先级：memory/bridge-config.json（管理面板修改，持久化）> 环境变量 > 内置默认。
 // 除 PORT / MEMORY_ROOT（进程生命周期内固定）外全部热生效：改完下一轮请求即用新值。
@@ -82,8 +95,8 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 // type: int | str | enum；lower=存前转小写；secret=面板打码；multiline=面板用多行框；
 // enum 的 values 里 '' 表示"跟随默认/不设置"。
 const CONFIG_SCHEMA = {
-  CHAT_MODE: { group: '模型', label: '回复通道', type: 'enum', values: ['sdk', 'api'], lower: true, def: 'sdk',
-    desc: 'sdk=Claude Code 订阅登录态（零 API 费用）；api=任意 OpenAI 兼容端点（GPT/Grok 等，下面三项生效），无 Claude 订阅也能用全套记忆系统' },
+  CHAT_MODE: { group: '模型', label: '回复通道', type: 'enum', values: ['claude-code', 'codex', 'api'], lower: true, def: 'codex',
+    desc: 'claude-code=Claude Code 订阅；codex=ChatGPT/Codex 订阅；api=任意 OpenAI 兼容端点（自备 key）' },
   CHAT_API_URL: { group: '模型', label: '回复 API 地址', type: 'str', def: '',
     desc: 'api 通道的 OpenAI 兼容端点，如 https://api.openai.com/v1、https://api.x.ai/v1 或中转地址' },
   CHAT_API_KEY: { group: '模型', label: '回复 API 密钥', type: 'str', secret: true, def: '' },
@@ -94,9 +107,18 @@ const CONFIG_SCHEMA = {
   API_IDLE_TIMEOUT: { group: '模型', label: '流空闲超时 (ms)', type: 'int', min: 5000, def: 300000,
     desc: 'api 通道流式：连续这么久收不到任何数据块（含思维增量/心跳）判定死流并断开；反代卡死时靠它解锁' },
   BRIDGE_MODEL: { group: '模型', label: '默认回复模型', type: 'enum', values: MODELS, def: 'claude-sonnet-5',
-    desc: 'sdk 通道下，ST 未指定或指定了未知模型时使用' },
-  CHAT_EFFORT: { group: '模型', label: '回复推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: '', emptyLabel: '（SDK 默认 high）',
-    desc: '仅 sdk 通道生效。空 = 跟随 SDK 默认（high）。低档出字快、消耗低，高档叙事更深' },
+    desc: 'claude-code 通道下，ST 未指定或指定了未知模型时使用' },
+  CODEX_COMMAND: { group: '模型', label: 'Codex 登录检查命令', type: 'str', def: 'codex',
+    desc: '仅用于检查 ChatGPT 登录态的 Codex CLI 命令名或完整路径；实际生成由官方 @openai/codex-sdk 执行' },
+  CODEX_CHAT_MODEL: { group: '模型', label: 'Codex 默认回复模型', type: 'str', def: 'gpt-5.6-sol',
+    options: ['', ...CODEX_MODELS], emptyLabel: '（SDK 默认 / 不固定）',
+    desc: '内置推荐 Sol；ST 下拉框选中的 Codex 模型优先。留空 = 不固定，交给 Codex SDK 选择' },
+  CODEX_EXTRA_MODELS: { group: '模型', label: 'Codex 附加模型', type: 'str', def: '',
+    desc: '可选：逗号或换行分隔的额外模型 ID；会加入 ST 模型列表，适合新模型或工作区专属模型' },
+  CODEX_TIMEOUT: { group: '模型', label: 'Codex 总超时 (ms)', type: 'int', min: 10000, def: 600000,
+    desc: 'Codex 单次回复、记忆或回溯任务的最长运行时间' },
+  CHAT_EFFORT: { group: '模型', label: '回复推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: 'medium', emptyLabel: '（跟随后端默认）',
+    desc: '内置推荐 medium；claude-code/codex 通道生效。空 = 跟随后端默认；低档出字快、消耗低，高档叙事更深' },
   CONTINUE_PROMPT: { group: '模型', label: '续写指令', type: 'str', multiline: true,
     def: '衔接 transcript 最后一条消息，遵循 system 中的全部设定（包括视角、人称、文风与角色分配），自然地续写下一条回复。只输出回复正文，不要输出任何解释或前缀。',
     desc: '拼在每次请求末尾的中性续写指令，视角/人称交给预设决定' },
@@ -106,11 +128,13 @@ const CONFIG_SCHEMA = {
   RECENT_TURNS_MAX: { group: '窗口', label: '锚定窗口上限', type: 'int', min: 0, def: 0,
     desc: '0=关闭。设为大于窗口轮数启用锚定：窗口起点固定、正文纯追加省缓存，涨到上限一次性收缩。只在两轮间隔小于缓存寿命（5 分钟）的快节奏对话中有收益' },
 
-  RECALL_MODE: { group: '回溯', label: '回溯模式', type: 'enum', values: ['sdk', 'api', 'off'], lower: true, def: 'sdk' },
+  RECALL_MODE: { group: '回溯', label: '回溯模式', type: 'enum', values: ['claude-code', 'codex', 'api', 'off'], lower: true, def: 'codex' },
   RECALL_MODEL: { group: '回溯', label: '出词模型', type: 'str', def: 'claude-haiku-4-5-20251001',
     options: ['claude-haiku-4-5-20251001', ...MODELS],
-    desc: '仅 sdk 模式生效。出词是机械任务，默认用便宜快速的 Haiku 即可' },
-  RECALL_EFFORT: { group: '回溯', label: '出词推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: 'low', emptyLabel: '（SDK 默认 high）',
+    desc: '仅 claude-code 模式生效。出词是机械任务，默认用便宜快速的 Haiku 即可' },
+  CODEX_RECALL_MODEL: { group: '回溯', label: 'Codex 出词模型', type: 'str', def: 'gpt-5.6-luna', options: ['', ...CODEX_MODELS], emptyLabel: '（SDK 默认 / 不固定）',
+    desc: '内置推荐 Luna；仅 codex 模式生效。留空 = 不固定，交给 Codex SDK 选择' },
+  RECALL_EFFORT: { group: '回溯', label: '出词推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: 'low', emptyLabel: '（跟随后端默认）',
     desc: '出词是机械任务，低档即可' },
   RECALL_THINKING_BUDGET: { group: '回溯', label: '出词思考上限', type: 'int', min: 0, def: 2000,
     desc: '思考 token 硬上限，防止回忆密集轮长考超时；0=不设限的自适应' },
@@ -123,11 +147,13 @@ const CONFIG_SCHEMA = {
   RECALL_API_KEY: { group: '回溯', label: 'API 密钥', type: 'str', secret: true, def: '' },
   RECALL_API_MODEL: { group: '回溯', label: 'API 模型', type: 'str', def: '' },
 
-  MEMORY_MODE: { group: '记忆', label: '记忆模式', type: 'enum', values: ['sdk', 'agent', 'api'], lower: true, def: 'sdk',
-    desc: 'sdk=订阅 agent 带文件工具增量编辑；agent=自配端点的函数调用 agent（同样增量编辑，需模型支持工具调用，GPT/Grok 前沿模型适用）；api=自配端点全文件重写（不依赖工具调用，兼容性最强）。agent/api 共用下方 API 三项' },
+  MEMORY_MODE: { group: '记忆', label: '记忆模式', type: 'enum', values: ['claude-code', 'codex', 'agent', 'api'], lower: true, def: 'codex',
+    desc: 'claude-code/codex=订阅 agent 带文件工具增量编辑；agent=自配端点的函数调用 agent；api=自配端点全文件重写。agent/api 共用下方 API 三项' },
   MEMORY_MODEL: { group: '记忆', label: '记忆模型', type: 'str', def: '', options: ['', ...MODELS], emptyLabel: '（跟随默认回复模型）',
-    desc: '仅 sdk 模式生效。空 = 跟随默认回复模型，记账质量与主模型对齐；可指定便宜档位省额度' },
-  MEMORY_EFFORT: { group: '记忆', label: '记忆推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: 'medium', emptyLabel: '（SDK 默认 high）',
+    desc: '仅 claude-code 模式生效。空 = 跟随默认回复模型，记账质量与主模型对齐；可指定便宜档位省额度' },
+  CODEX_MEMORY_MODEL: { group: '记忆', label: 'Codex 记忆模型', type: 'str', def: 'gpt-5.6-terra', options: ['', ...CODEX_MODELS], emptyLabel: '（SDK 默认 / 不固定）',
+    desc: '内置推荐 Terra；仅 codex 模式生效。留空 = 不固定，交给 Codex SDK 选择' },
+  MEMORY_EFFORT: { group: '记忆', label: '记忆推理力度', type: 'enum', values: ['', ...EFFORTS], lower: true, def: 'medium', emptyLabel: '（跟随后端默认）',
     desc: '默认 medium：比 high 显著缩短更新耗时，档案质量实测无损' },
   MEMORY_MAX_TURNS: { group: '记忆', label: '工具回合上限', type: 'int', min: 4, def: 30,
     desc: '记忆 agent 的最大工具回合数，长回复+5文件读写实测可超 15' },
@@ -142,7 +168,7 @@ const CONFIG_SCHEMA = {
   DICE_TRIGGER: { group: '掷骰', label: '触发方式', type: 'enum', values: ['auto', 'always'], lower: true, def: 'auto',
     desc: 'auto=检测到规则关键词才启用，非跑团场景零介入' },
   DICE_MAX_TURNS: { group: '掷骰', label: '工具回合上限', type: 'int', min: 2, def: 12,
-    desc: 'tool 模式下回复 agent 的回合上限；默认 12 足够覆盖多次检定的战斗轮' },
+    desc: 'tool 模式上限：Claude Code 的 agent 回合数 / Codex 的 roll 调用数；默认 12 足够覆盖多次检定的战斗轮' },
 };
 
 function normalizeConfig(key, raw) {
@@ -155,6 +181,10 @@ function normalizeConfig(key, raw) {
   }
   let v = String(raw ?? '').trim();
   if (s.lower) v = v.toLowerCase();
+  // 兼容旧版配置与人类常用写法；持久化后统一使用稳定 slug。
+  if (['CHAT_MODE', 'RECALL_MODE', 'MEMORY_MODE'].includes(key)) {
+    if (v === 'sdk' || v === 'claude code' || v === 'claude_code') v = 'claude-code';
+  }
   if (key.endsWith('_API_URL')) v = v.replace(/\/+$/, '');
   if (s.type === 'enum' && !s.values.includes(v)) {
     return { err: `可选值: ${s.values.map(x => x || '(空)').join(' | ')}` };
@@ -217,14 +247,31 @@ function publicConfig() {
   return out;
 }
 
-// api 后端配置不全时的兜底判定（配置可热改，故在使用时校验而非启动时）
+function codexModelsNow() {
+  const extra = String(CFG.CODEX_EXTRA_MODELS || '').split(/[,;\r\n]+/).map(x => x.trim()).filter(Boolean);
+  return [...new Set([
+    ...CODEX_MODELS,
+    ...extra,
+    CFG.CODEX_CHAT_MODEL,
+    CFG.CODEX_MEMORY_MODEL,
+    CFG.CODEX_RECALL_MODEL,
+  ].filter(Boolean))];
+}
+
+function selectCodexChatModel(requested) {
+  const value = String(requested || '').trim();
+  if (value && value !== 'codex-default' && codexModelsNow().includes(value)) return value;
+  return CFG.CODEX_CHAT_MODEL || '';
+}
+
+// 配置可热改，故在使用时判定；不同计费通道之间绝不静默回退。
 function memoryModeNow() {
-  if (CFG.MEMORY_MODE !== 'api' && CFG.MEMORY_MODE !== 'agent') return 'sdk';
-  if (!CFG.MEMORY_API_URL || !CFG.MEMORY_API_MODEL) {
-    console.warn(`[memory] MEMORY_MODE=${CFG.MEMORY_MODE} 但缺少 MEMORY_API_URL / MEMORY_API_MODEL，本轮回退 sdk`);
-    return 'sdk';
-  }
   return CFG.MEMORY_MODE;
+}
+function assertMemoryModeConfigured(mode) {
+  if ((mode === 'api' || mode === 'agent') && (!CFG.MEMORY_API_URL || !CFG.MEMORY_API_MODEL)) {
+    throw new Error(`MEMORY_MODE=${mode} 需要配置 MEMORY_API_URL / MEMORY_API_MODEL；未执行跨通道回退`);
+  }
 }
 function recallModeNow() {
   if (CFG.RECALL_MODE === 'api' && (!CFG.RECALL_API_URL || !CFG.RECALL_API_MODEL)) {
@@ -234,12 +281,7 @@ function recallModeNow() {
   return CFG.RECALL_MODE;
 }
 function chatModeNow() {
-  if (CFG.CHAT_MODE !== 'api') return 'sdk';
-  if (!CFG.CHAT_API_URL) {
-    console.warn('[chat] CHAT_MODE=api 但未配置 CHAT_API_URL，本轮回退 sdk');
-    return 'sdk';
-  }
-  return 'api';
+  return CFG.CHAT_MODE;
 }
 
 // ---------- 用量统计 ----------
@@ -835,12 +877,17 @@ const MEMORY_FILE_SPEC = [
   '- timeline.md：按事件压缩的编年史（追加，不重写历史）。每条新条目控制在 200 字内，只记骨架：时间地点、人物、事件与结果、数值变化（好感度/资源/任务状态）；不复述场景氛围与对白——细节已由轮号指针兜底，可随时按号回捞原文。条目末尾标注来源轮号如（#12-13）；合并压缩旧条目时保留全部事实要点与合并后的轮号范围，轮号不可丢弃。',
   '- foreshadowing.md：未回收的伏笔与悬念',
 ];
-const MEMORY_RULES = '只记录本轮新增或变化的信息；保持每个文件精炼（超过约 200 行时压缩旧内容）。聊天原文中的变量标记、状态栏/前端代码、思维链推演等非叙事内容一律不要写入档案，只提炼其中的叙事事实。本轮交互的轮号已在交互块属性中直接给出，新条目照抄即可；不要重复核对、改写既有条目的轮号标注，也不要为校验轮号去通读 transcript——每轮更新应当只围绕本轮新信息，快进快出。';
+const MEMORY_RULES = [
+  '只记录本轮新增或变化的信息；保持每个文件精炼（超过约 200 行时压缩旧内容）。',
+  '聊天原文中的变量标记、状态栏/前端代码、思维链推演等非叙事内容不得照抄进档案。<UpdateVariable>/<JSONPatch> 只可作为时间、HP、金钱、物品、任务进度等确定状态变化的辅助证据；<Analysis>、思维链和名为“心里话”的字段不得升格为客观事实、已公开情报或角色说过的话，除非叙事正文也明确呈现。',
+  '严格保留原文的人物、路线、数量和条件指代；“两条”“双方”“他们”等指代若不能确定，使用保守措辞或回查对应轮次，不得自行替换主语。稳定的 NPC 特征、债务、恐惧、承诺等应合并到该 NPC 的常驻条目，不要只留在“本轮更新”或伏笔中。',
+  '本轮交互的轮号已在交互块属性中直接给出，新条目照抄即可；不要重复核对、改写既有条目的轮号标注，也不要为校验轮号去通读 transcript——每轮更新应当只围绕本轮新信息，快进快出。',
+].join('');
 const MEMORY_MD_FILES = ['world_state.md', 'party.md', 'npc_ledger.md', 'timeline.md', 'foreshadowing.md'];
 
 // 记忆任务每次动笔前把现有档案滚动备份到 memory/backups/<战役id>/<时间戳>-<来源>/，
 // 环形保留最近 10 份——agent 万一改坏文件（或某批补课跑偏）可手工拷回。放在战役目录
-// 之外是刻意的：sdk 模式记忆 agent 的 cwd 在战役目录内，别让它 Glob 到旧备份产生混淆。
+// 之外是刻意的：订阅 agent 的 cwd 在战役目录内，别让它搜到旧备份产生混淆。
 const BACKUP_KEEP = 10;
 function backupMemoryFiles(campaign, reason) {
   try {
@@ -868,8 +915,8 @@ function memoryExchangeBlock(lastUserText, replyText, notes, replyNo) {
   ].join('\n');
 }
 
-// sdk 模式：agent 带文件工具在战役目录内增量编辑
-async function updateMemorySdk(campaign, lastUserText, replyText, notes, startedAt, replyNo) {
+// claude-code 模式：agent 带文件工具在战役目录内增量编辑
+async function updateMemoryClaudeCode(campaign, lastUserText, replyText, notes, startedAt, replyNo) {
   const prompt = [
     '你是战役记忆管理器。根据下面这一轮最新交互，更新当前目录下的战役档案（Markdown 文件）。',
     '维护这些文件（不存在则创建）：',
@@ -880,7 +927,7 @@ async function updateMemorySdk(campaign, lastUserText, replyText, notes, started
     memoryExchangeBlock(lastUserText, replyText, notes, replyNo),
   ].join('\n');
 
-  const { query } = await loadSdk();
+  const { query } = await loadClaudeCode();
   for await (const msg of query({
     prompt,
     options: {
@@ -895,9 +942,57 @@ async function updateMemorySdk(campaign, lastUserText, replyText, notes, started
   })) {
     if (msg.type === 'result') {
       const tag = trackUsage('memory', campaign, msg.usage);
-      if (msg.subtype !== 'success') throw new Error(`SDK result: ${msg.subtype}`);
-      console.log(`[memory] ${campaign.id} 更新完成 (sdk, ${((Date.now() - startedAt) / 1000).toFixed(1)}s, ${msg.num_turns} turns)${tag}`);
+      if (msg.subtype !== 'success') throw new Error(`Claude Code result: ${msg.subtype}`);
+      console.log(`[memory] ${campaign.id} 更新完成 (claude-code, ${((Date.now() - startedAt) / 1000).toFixed(1)}s, ${msg.num_turns} turns)${tag}`);
     }
+  }
+}
+
+// codex 模式：使用 ChatGPT 登录态运行 Codex，工作区仅限当前战役目录。
+// Codex 自带读写/搜索工具，因此与 Claude Code 一样做增量编辑，不需要把整份档案塞回模型输出。
+async function updateMemoryCodex(campaign, lastUserText, replyText, notes, startedAt, replyNo) {
+  const prompt = [
+    '你是 SillyTavern 战役记忆管理器。根据下面这一轮最新交互，直接更新当前工作目录里的战役档案。',
+    '只允许读取 transcript.jsonl 和下列五个 Markdown 档案，只允许创建或修改这五个 Markdown 文件；不得修改 transcript.jsonl、meta.json 或其他文件。',
+    '维护这些文件（不存在则创建）：',
+    ...MEMORY_FILE_SPEC,
+    MEMORY_RULES,
+    '完整对话原文在 transcript.jsonl（每行一条 JSON，行号即轮号 #N）；只有确需核对旧细节时才搜索它。',
+    '完成文件更新后，用一句话简述更新了哪些档案；不要输出档案全文。',
+    '',
+    memoryExchangeBlock(lastUserText, replyText, notes, replyNo),
+  ].join('\n');
+  const r = await runCodexMemoryWorkspace(campaign, prompt);
+  const tag = trackUsage('memory', campaign, r.usage);
+  console.log(`[memory] ${campaign.id} 更新完成 (codex, ${((Date.now() - startedAt) / 1000).toFixed(1)}s)${tag}`);
+}
+
+// Codex 的 workspace-write 只授予一次性暂存目录；成功后仅同步五个白名单档案。
+// transcript 只作为副本提供，meta 和战役目录中的其他文件从未暴露为可写目标。
+async function runCodexMemoryWorkspace(campaign, prompt) {
+  const staging = fs.mkdtempSync(path.join(MEMORY_ROOT, '.codex-memory-'));
+  try {
+    for (const f of [...MEMORY_MD_FILES, 'transcript.jsonl']) {
+      const src = path.join(campaign.dir, f);
+      if (fs.existsSync(src)) fs.copyFileSync(src, path.join(staging, f));
+    }
+    const r = await runCodex({
+      command: CFG.CODEX_COMMAND || 'codex',
+      prompt,
+      cwd: staging,
+      model: CFG.CODEX_MEMORY_MODEL,
+      effort: CFG.MEMORY_EFFORT,
+      sandbox: 'workspace-write',
+      timeoutMs: CFG.CODEX_TIMEOUT,
+    });
+    fs.mkdirSync(campaign.dir, { recursive: true });
+    for (const f of MEMORY_MD_FILES) {
+      const edited = path.join(staging, f);
+      if (fs.existsSync(edited)) fs.copyFileSync(edited, path.join(campaign.dir, f));
+    }
+    return r;
+  } finally {
+    fs.rmSync(staging, { recursive: true, force: true });
   }
 }
 
@@ -945,7 +1040,7 @@ function writeMemoryFiles(campaign, out) {
 
 // ---------- 记忆 agent（API 函数调用循环，MEMORY_MODE=agent） ----------
 // 面向无 Claude 订阅的部署：任意支持工具调用的 OpenAI 兼容端点（GPT/Grok 等前沿模型），
-// 与 sdk 模式一样做增量编辑。工具围栏：只可写五个档案 md、transcript 只读，
+// 与 claude-code/codex 模式一样做增量编辑。工具围栏：只可写五个档案 md、transcript 只读，
 // 全部操作锁死在战役目录内。不支持工具调用的模型请用 api（全文件重写）模式。
 const AGENT_TOOLS = [
   { type: 'function', function: { name: 'read_file',
@@ -1082,7 +1177,7 @@ async function updateMemoryAgent(campaign, lastUserText, replyText, notes, start
 }
 
 // 本轮交互未能记账（任务失败/被跳过）时，降级为修正说明挂账：下一次更新的
-// <corrections> 块里带轮号和节选要求补记，sdk 模式的 agent 还能按轮号自行
+// <corrections> 块里带轮号和节选要求补记，订阅 agent 还能按轮号自行
 // Read transcript.jsonl 核对全文。挂账上限防连续失败时膨胀。
 function queueMissedExchange(campaign, replyNo, lastUserText, replyText, why) {
   if (campaign.pendingNotes.length >= 8) return;
@@ -1108,9 +1203,11 @@ async function updateMemory(campaign, lastUserText, replyText) {
   const replyNo = campaign.transcript.length;
   try {
     const mode = memoryModeNow();
+    assertMemoryModeConfigured(mode);
     if (mode === 'api') await updateMemoryApi(campaign, lastUserText, replyText, notes, startedAt, replyNo);
     else if (mode === 'agent') await updateMemoryAgent(campaign, lastUserText, replyText, notes, startedAt, replyNo);
-    else await updateMemorySdk(campaign, lastUserText, replyText, notes, startedAt, replyNo);
+    else if (mode === 'codex') await updateMemoryCodex(campaign, lastUserText, replyText, notes, startedAt, replyNo);
+    else await updateMemoryClaudeCode(campaign, lastUserText, replyText, notes, startedAt, replyNo);
     saveCampaign(campaign); // 持久化 meta 里的用量累计
   } catch (e) {
     campaign.pendingNotes.unshift(...notes); // 失败不丢修正，下一轮补上
@@ -1125,7 +1222,11 @@ async function updateMemory(campaign, lastUserText, replyText) {
 // 分批把已归档但未记账的早期轮次喂给记忆 agent，构建 timeline（含轮号标注）等
 // 档案。批间落盘 meta.catchupTo，中断后重新触发即可续跑；每批复用 memoryJobRunning
 // 互斥，与在线对话的常规记忆更新互不重入（补课批运行期间，当轮更新会照常跳过）。
-const CATCHUP_RULES = '补课规则：timeline 按时间顺序为这批轮次补写条目（骨架格式，每条 200 字内只记骨架：时间地点、人物、事件与结果、数值变化；条目末尾标注来源轮号如（#12-13），轮号已在每条消息的属性中直接给出，照抄即可）。world_state/party/npc_ledger/foreshadowing 更新到这批轮次为止的最新状态（后续批次会继续推进，不必预判）。聊天原文中的变量标记、状态栏/前端代码、思维链推演等非叙事内容一律不要写入档案。不要为核对而去通读 transcript 的其他部分——快进快出。';
+const CATCHUP_RULES = [
+  '补课规则：timeline 按时间顺序为这批轮次补写条目（骨架格式，每条 200 字内只记骨架：时间地点、人物、事件与结果、数值变化；条目末尾标注来源轮号如（#12-13），轮号已在每条消息的属性中直接给出，照抄即可）。world_state/party/npc_ledger/foreshadowing 更新到这批轮次为止的最新状态（后续批次会继续推进，不必预判）。',
+  '<UpdateVariable>/<JSONPatch> 只可辅助确认客观状态变化；<Analysis>、思维链和“心里话”字段不得当成客观事实、公开情报或对白。人物、路线、数量与条件指代必须忠实于原文，歧义时保守记录，不得自行补主语。稳定的 NPC 特征应合并到该 NPC 的常驻条目。',
+  '聊天原文中的变量标记、状态栏/前端代码、思维链推演等非叙事内容不得照抄进档案。不要为核对而去通读 transcript 的其他部分——快进快出。',
+].join('');
 
 function catchupBlock(campaign, from, to) {
   const lines = [];
@@ -1136,7 +1237,7 @@ function catchupBlock(campaign, from, to) {
   return `<archived_turns range="#${from + 1}-#${to}">\n${lines.join('\n')}\n</archived_turns>`;
 }
 
-async function catchupBatchSdk(campaign, from, to) {
+async function catchupBatchClaudeCode(campaign, from, to) {
   const prompt = [
     '你是战役记忆管理器。这是一次"补课"：战役对话原文已完整归档，但档案尚未覆盖下面这批早期轮次。请通读这批原文，把其中的叙事事实补入当前目录下的战役档案（Markdown 文件）。',
     '维护这些文件（不存在则创建）：',
@@ -1145,7 +1246,7 @@ async function catchupBatchSdk(campaign, from, to) {
     '',
     catchupBlock(campaign, from, to),
   ].join('\n');
-  const { query } = await loadSdk();
+  const { query } = await loadClaudeCode();
   let tag = '';
   for await (const msg of query({
     prompt,
@@ -1161,10 +1262,25 @@ async function catchupBatchSdk(campaign, from, to) {
   })) {
     if (msg.type === 'result') {
       tag = trackUsage('memory', campaign, msg.usage);
-      if (msg.subtype !== 'success') throw new Error(`SDK result: ${msg.subtype}`);
+      if (msg.subtype !== 'success') throw new Error(`Claude Code result: ${msg.subtype}`);
     }
   }
   return tag;
+}
+
+async function catchupBatchCodex(campaign, from, to) {
+  const prompt = [
+    '你是 SillyTavern 战役记忆管理器。这是一次“补课”：请把下面这批早期轮次的叙事事实直接补进当前工作目录的档案。',
+    '只允许读取 transcript.jsonl 和下列五个 Markdown 档案，只允许创建或修改这五个 Markdown 文件；不得修改 transcript.jsonl、meta.json 或其他文件。',
+    '维护这些文件（不存在则创建）：',
+    ...MEMORY_FILE_SPEC,
+    CATCHUP_RULES,
+    '完成后用一句话简述更新了哪些档案；不要输出档案全文。',
+    '',
+    catchupBlock(campaign, from, to),
+  ].join('\n');
+  const r = await runCodexMemoryWorkspace(campaign, prompt);
+  return trackUsage('memory', campaign, r.usage);
 }
 
 async function catchupBatchAgent(campaign, from, to) {
@@ -1217,9 +1333,11 @@ async function runCatchup(campaign) {
       const startedAt = Date.now();
       try {
         const mode = memoryModeNow();
+        assertMemoryModeConfigured(mode);
         const tag = mode === 'api' ? await catchupBatchApi(campaign, from, to)
           : mode === 'agent' ? await catchupBatchAgent(campaign, from, to)
-            : await catchupBatchSdk(campaign, from, to);
+            : mode === 'codex' ? await catchupBatchCodex(campaign, from, to)
+              : await catchupBatchClaudeCode(campaign, from, to);
         console.log(`[memory] ${campaign.id} 补课 #${from + 1}-#${to} 完成 (${((Date.now() - startedAt) / 1000).toFixed(1)}s)${tag}`);
       } finally {
         campaign.memoryJobRunning = false;
@@ -1245,12 +1363,24 @@ async function runCatchup(campaign) {
 // 仅当归档长度超出提示词窗口（RECENT_TURNS）时才启动；窗口内的内容本来就在 prompt 里。
 // 各项参数见 CONFIG_SCHEMA 的"回溯"组，可经管理面板热改。
 
-// 两种后端共用的"文本进文本出"单轮补全，返回 { text, usage }
+// 三种后端共用的“文本进文本出”单轮补全，返回 { text, usage }
 async function completeText(system, prompt) {
-  if (CFG.RECALL_MODE === 'api') {
+  const mode = recallModeNow();
+  if (mode === 'api') {
     return openaiChat({ url: CFG.RECALL_API_URL, key: CFG.RECALL_API_KEY, model: CFG.RECALL_API_MODEL }, system, prompt);
   }
-  const { query } = await loadSdk();
+  if (mode === 'codex') {
+    return runCodex({
+      command: CFG.CODEX_COMMAND || 'codex',
+      prompt: `<system_instructions>\n${system}\n</system_instructions>\n\n<task>\n${prompt}\n</task>\n\n只输出任务要求的文本，不要解释，不要读取或修改文件。`,
+      cwd: MEMORY_ROOT,
+      model: CFG.CODEX_RECALL_MODEL,
+      effort: CFG.RECALL_EFFORT,
+      sandbox: 'read-only',
+      timeoutMs: Math.min(CFG.CODEX_TIMEOUT, CFG.RECALL_TIMEOUT),
+    });
+  }
+  const { query } = await loadClaudeCode();
   let text = '';
   let usage = null;
   for await (const msg of query({
@@ -1470,31 +1600,19 @@ function diceArmed(systemPrompt) {
 
 let diceRollCount = 0; // 本进程累计真实掷骰次数，用于事后核对回复中的骰点是否出自工具
 
-// 解析并投掷 NdM+K（1≤N≤100，2≤M≤1000），crypto 真随机
-function rollFormula(formula) {
-  const m = String(formula).trim().match(/^(\d{0,3})[dD](\d{1,4})\s*([+-]\s*\d{1,4})?$/);
-  if (!m) throw new Error(`无法解析骰式: ${formula}（支持 NdM+K，如 1d20+5、2d6、d100）`);
-  const n = Math.min(Math.max(Number(m[1] || 1), 1), 100);
-  const faces = Math.min(Math.max(Number(m[2]), 2), 1000);
-  const mod = m[3] ? Number(m[3].replace(/\s/g, '')) : 0;
-  const rolls = Array.from({ length: n }, () => crypto.randomInt(1, faces + 1));
-  const total = rolls.reduce((a, b) => a + b, 0) + mod;
-  const modText = mod ? (mod > 0 ? ` +${mod}` : ` ${mod}`) : '';
-  return { total, text: `${n}d${faces}${modText} = [${rolls.join(', ')}]${modText} = ${total}` };
-}
-
-// 骰子 MCP 服务器懒构建（依赖 Agent SDK，仅 sdk 通道的 tool 模式用到）
+// Claude Code 使用进程内 MCP；Codex 使用 dice-mcp-server.mjs 的 STDIO MCP。
+// 两边共享 dice.mjs 中完全相同的骰式解析与 crypto 真随机实现。
 let _diceServer = null;
 async function getDiceServer() {
   if (_diceServer) return _diceServer;
-  const { tool, createSdkMcpServer } = await loadSdk();
+  const { tool, createSdkMcpServer } = await loadClaudeCode();
   _diceServer = createSdkMcpServer({
     name: 'dice',
     version: '1.0.0',
     tools: [
       tool(
         'roll',
-        '真随机掷骰。仅在剧情确实需要骰点（属性/技能检定、攻击、伤害、先攻、随机表等）时调用，formula 形如 1d20+5、2d6、d100。必须以返回的结果为准叙述成败，不得自行虚构点数。',
+        DICE_TOOL_DESCRIPTION,
         { formula: z.string().describe('骰式，NdM+K 格式') },
         async ({ formula }) => {
           try {
@@ -1596,13 +1714,13 @@ function buildPrompt(body) {
   const prompt = [droppedNote, '<transcript>', transcriptText, '</transcript>', memoryText]
     .filter(Boolean).join('\n');
 
-  // recent/droppedNote/memoryText 供 api 通道组装原生 messages 数组（sdk 通道用拼好的 prompt）
+  // recent/droppedNote/memoryText 供 api 通道组装原生 messages；订阅 agent 通道用拼好的 prompt
   return { campaign, systemPrompt, prompt, recent, droppedNote, memoryText, lastUserText };
 }
 
-// ---------- SDK 调用 ----------
-async function* generate(model, systemPrompt, prompt, cwd, usageOut = {}, withDice = false) {
-  const { query } = await loadSdk();
+// ---------- Claude Code / Codex 调用 ----------
+async function* generateClaudeCode(model, systemPrompt, prompt, cwd, usageOut = {}, withDice = false) {
+  const { query } = await loadClaudeCode();
   const q = query({
     prompt,
     options: {
@@ -1625,10 +1743,56 @@ async function* generate(model, systemPrompt, prompt, cwd, usageOut = {}, withDi
         yield ev.delta.text;
       }
     } else if (msg.type === 'result') {
-      if (msg.subtype !== 'success') throw new Error(`SDK result: ${msg.subtype}`);
+      if (msg.subtype !== 'success') throw new Error(`Claude Code result: ${msg.subtype}`);
       usageOut.usage = msg.usage || null;
     }
   }
+}
+
+function codexChatPrompt(systemPrompt, prompt) {
+  return [
+    '<roleplay_system_instructions>',
+    systemPrompt,
+    '</roleplay_system_instructions>',
+    '',
+    '<conversation_context>',
+    prompt,
+    '</conversation_context>',
+    '',
+    '<bridge_contract>',
+    '你正在为 SillyTavern 生成角色扮演的下一条回复。严格遵循 roleplay_system_instructions 中的人设、世界观、视角、文风和边界。',
+    '只输出最终回复正文，不要解释任务，不要添加“assistant:”等前缀，不要汇报推理过程。',
+    '本任务不需要读取文件、执行命令或修改工作区；直接根据上面的上下文作答。',
+    '</bridge_contract>',
+  ].join('\n');
+}
+
+async function generateCodex(systemPrompt, prompt, cwd, usageOut = {}, signal, onText = () => {}, selectedModel = '', withDice = false) {
+  const r = await runCodex({
+    command: CFG.CODEX_COMMAND || 'codex',
+    prompt: codexChatPrompt(systemPrompt, prompt),
+    cwd,
+    model: selectedModel,
+    effort: CFG.CHAT_EFFORT,
+    sandbox: 'read-only',
+    timeoutMs: CFG.CODEX_TIMEOUT,
+    signal,
+    onText,
+    ...(withDice ? {
+      mcpServers: buildDiceMcpServers({ serverPath: DICE_MCP_SERVER, maxCalls: CFG.DICE_MAX_TURNS }),
+      onMcpTool: event => {
+        if (event.server !== 'dice' || event.tool !== 'roll') return;
+        if (event.error || event.status === 'failed') {
+          console.warn(`[dice] Codex roll 失败：${event.error || event.text || event.status}`);
+          return;
+        }
+        diceRollCount++;
+        console.log(`[dice] ${event.text || JSON.stringify(event.arguments)}`);
+      },
+    } : {}),
+  });
+  usageOut.usage = r.usage;
+  return r.text;
 }
 
 // ---------- OpenAI 兼容层 ----------
@@ -1648,7 +1812,7 @@ function toOpenaiUsage(rawUsage) {
   return { prompt_tokens: prompt, completion_tokens: n.output, total_tokens: prompt + n.output };
 }
 
-// 转发 ST 请求里的常用生成参数（api 通道用；SDK 通道由 Claude Code 自管）
+// 转发 ST 请求里的常用生成参数（api 通道用；订阅 agent 通道由各自运行时管理）
 function pickGenParams(body) {
   const out = {};
   for (const k of ['temperature', 'top_p', 'frequency_penalty', 'presence_penalty',
@@ -1674,24 +1838,31 @@ async function handleChat(req, res, body) {
   }
   const id = 'chatcmpl-' + Math.random().toString(36).slice(2);
   const stream = body.stream !== false;
-  const chatApi = chatModeNow() === 'api';
+  const chatMode = chatModeNow();
+  const chatApi = chatMode === 'api';
+  const chatCodex = chatMode === 'codex';
+  if (chatApi && !CFG.CHAT_API_URL) {
+    throw new Error('CHAT_MODE=api 需要配置 CHAT_API_URL；未执行跨通道回退');
+  }
   const model = chatApi
     ? (CFG.CHAT_API_MODEL || body.model || 'api-model')
-    : (MODELS.includes(body.model) ? body.model : CFG.BRIDGE_MODEL);
+    : chatCodex
+      ? (selectCodexChatModel(body.model) || 'codex-default')
+      : (MODELS.includes(body.model) ? body.model : CFG.BRIDGE_MODEL);
   const cwd = campaign ? campaign.dir : MEMORY_ROOT;
   const usageOut = {};
   let full = '';
 
   // 掷骰：按 system（预设+卡+世界书）中的规则关键词决定是否启用，非跑团场景零介入。
-  // api 通道暂不支持工具掷骰（MCP 是 SDK 专属），tool 配置自动降级为熵池。
+  // Claude Code 使用进程内 MCP，Codex 使用独立 STDIO MCP；API 通道的 tool 配置降级为熵池。
   let withDice = false;
   const diceCallsBefore = diceRollCount;
   const armed = diceArmed(baseSystem);
-  if (armed && CFG.DICE_MODE === 'tool' && !chatApi) {
+  if (armed && CFG.DICE_MODE === 'tool' && (chatMode === 'claude-code' || chatMode === 'codex')) {
     systemPrompt += DICE_TOOL_HINT;
     withDice = true;
-  } else if (armed && (CFG.DICE_MODE === 'pool' || (CFG.DICE_MODE === 'tool' && chatApi))) {
-    if (CFG.DICE_MODE === 'tool') console.log('[dice] api 通道不支持工具掷骰，本轮降级为熵池注入');
+  } else if (armed && (CFG.DICE_MODE === 'pool' || CFG.DICE_MODE === 'tool')) {
+    if (CFG.DICE_MODE === 'tool') console.log(`[dice] ${chatMode} 通道暂未接工具掷骰，本轮降级为熵池注入`);
     const { pool, block } = buildDicePool();
     promptTail += block;
     console.log(`[dice] 熵池注入:\n${pool.split('\n').map(l => '        ' + l).join('\n')}`);
@@ -1723,9 +1894,9 @@ async function handleChat(req, res, body) {
     };
   }
   const apiCfg = { url: CFG.CHAT_API_URL, key: CFG.CHAT_API_KEY };
-  // 客户端断开（ST 停止生成/关页）时取消上游 fetch，省 token 也防悬挂
+  // 客户端断开（ST 停止生成/关页）时取消上游 API/Codex，省额度也防悬挂
   const clientGone = new AbortController();
-  if (chatApi) res.once('close', () => { if (!res.writableEnded) clientGone.abort(); });
+  if (chatApi || chatCodex) res.once('close', () => { if (!res.writableEnded) clientGone.abort(); });
 
   let finishOut = 'stop';
   const openSse = () => {
@@ -1746,9 +1917,15 @@ async function handleChat(req, res, body) {
         }, { onOpen: openSse, signal: clientGone.signal });
         usageOut.usage = r.usage;
         finishOut = r.finish;
+      } else if (chatCodex) {
+        openSse();
+        await generateCodex(systemPrompt, finalPrompt, cwd, usageOut, clientGone.signal, (text) => {
+          full += text;
+          res.write(sseChunk(id, model, { content: text }));
+        }, model === 'codex-default' ? '' : model, withDice);
       } else {
         openSse();
-        for await (const text of generate(model, systemPrompt, finalPrompt, cwd, usageOut, withDice)) {
+        for await (const text of generateClaudeCode(model, systemPrompt, finalPrompt, cwd, usageOut, withDice)) {
           full += text;
           res.write(sseChunk(id, model, { content: text }));
         }
@@ -1762,8 +1939,10 @@ async function handleChat(req, res, body) {
         full = contentText(r.choices?.[0]?.message?.content);
         finishOut = r.choices?.[0]?.finish_reason || 'stop';
         usageOut.usage = r.usage || null;
+      } else if (chatCodex) {
+        full = await generateCodex(systemPrompt, finalPrompt, cwd, usageOut, clientGone.signal, () => {}, model === 'codex-default' ? '' : model, withDice);
       } else {
-        for await (const text of generate(model, systemPrompt, finalPrompt, cwd, usageOut, withDice)) full += text;
+        for await (const text of generateClaudeCode(model, systemPrompt, finalPrompt, cwd, usageOut, withDice)) full += text;
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
@@ -1828,8 +2007,12 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.method === 'GET' && (url === '/v1/models' || url === '/models')) {
+    const mode = chatModeNow();
+    const ids = mode === 'codex' ? ['codex-default', ...codexModelsNow()]
+      : mode === 'api' ? [CFG.CHAT_API_MODEL || 'api-model']
+        : MODELS;
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ object: 'list', data: MODELS.map(id => ({ id, object: 'model', owned_by: 'st-claude-bridge' })) }));
+    res.end(JSON.stringify({ object: 'list', data: ids.map(id => ({ id, object: 'model', owned_by: 'st-claude-bridge' })) }));
     return;
   }
   if (req.method === 'POST' && (url === '/v1/chat/completions' || url === '/chat/completions')) {
@@ -1949,9 +2132,15 @@ server.on('upgrade', (req, socket, head) => {
 loadCampaigns();
 server.listen(PORT, '127.0.0.1', () => {
   const recallDesc = CFG.RECALL_MODE === 'off' ? 'off'
-    : CFG.RECALL_MODE === 'api' ? `api(${CFG.RECALL_API_MODEL})` : `sdk(${CFG.RECALL_MODEL})`;
-  const chatDesc = CFG.CHAT_MODE === 'api' ? `api(${CFG.CHAT_API_MODEL || '跟随请求'})` : `sdk(${CFG.BRIDGE_MODEL})`;
-  const memoryDesc = CFG.MEMORY_MODE === 'sdk' ? `sdk(${CFG.MEMORY_MODEL || CFG.BRIDGE_MODEL})` : `${CFG.MEMORY_MODE}(${CFG.MEMORY_API_MODEL})`;
+    : CFG.RECALL_MODE === 'api' ? `api(${CFG.RECALL_API_MODEL})`
+      : CFG.RECALL_MODE === 'codex' ? `codex(${CFG.CODEX_RECALL_MODEL || 'SDK 默认'})`
+        : `claude-code(${CFG.RECALL_MODEL})`;
+  const chatDesc = CFG.CHAT_MODE === 'api' ? `api(${CFG.CHAT_API_MODEL || '跟随请求'})`
+      : CFG.CHAT_MODE === 'codex' ? `codex(${CFG.CODEX_CHAT_MODEL || 'SDK 默认'})`
+      : `claude-code(${CFG.BRIDGE_MODEL})`;
+  const memoryDesc = CFG.MEMORY_MODE === 'claude-code' ? `claude-code(${CFG.MEMORY_MODEL || CFG.BRIDGE_MODEL})`
+      : CFG.MEMORY_MODE === 'codex' ? `codex(${CFG.CODEX_MEMORY_MODEL || 'SDK 默认'})`
+      : `${CFG.MEMORY_MODE}(${CFG.MEMORY_API_MODEL})`;
   const diceDesc = CFG.DICE_MODE === 'off' ? 'off' : `${CFG.DICE_MODE}/${CFG.DICE_TRIGGER}`;
   console.log(`st-claude-bridge listening on http://127.0.0.1:${PORT}/v1  (chat: ${chatDesc}, memory: ${memoryDesc}, recall: ${recallDesc}, dice: ${diceDesc}, campaigns: ${campaigns.size}, root: ${MEMORY_ROOT}, admin: ws://127.0.0.1:${PORT}/admin)`);
 });
